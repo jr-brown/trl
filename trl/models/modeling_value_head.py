@@ -13,7 +13,12 @@
 # limitations under the License.
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, is_torch_npu_available, is_torch_xpu_available
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForSeq2SeqLM,
+    is_torch_npu_available,
+    is_torch_xpu_available,
+)
 
 from .modeling_base import PreTrainedModelWrapper
 
@@ -30,7 +35,9 @@ class ValueHead(nn.Module):
         else:
             summary_dropout_prob = config.summary_dropout_prob
 
-        self.dropout = nn.Dropout(summary_dropout_prob) if summary_dropout_prob else nn.Identity()
+        self.dropout = (
+            nn.Dropout(summary_dropout_prob) if summary_dropout_prob else nn.Identity()
+        )
 
         # some models such as OPT have a projection layer before the word embeddings - e.g. OPT-350m
         if hasattr(config, "hidden_size"):
@@ -107,8 +114,13 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
         super().__init__(pretrained_model, **kwargs)
         v_head_kwargs, _, _ = self._split_kwargs(kwargs)
 
-        if not any(hasattr(self.pretrained_model, attribute) for attribute in self.lm_head_namings):
-            raise ValueError("The model does not have a language model head, please use a model that has one.")
+        if not any(
+            hasattr(self.pretrained_model, attribute)
+            for attribute in self.lm_head_namings
+        ):
+            raise ValueError(
+                "The model does not have a language model head, please use a model that has one."
+            )
 
         self.v_head = ValueHead(self.pretrained_model.config, **v_head_kwargs)
 
@@ -162,10 +174,15 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
             kwargs (`dict`, `optional`):
                 Additional keyword arguments, that are passed to the wrapped model.
         """
-        kwargs["output_hidden_states"] = True  # this had already been set in the LORA / PEFT examples
+        kwargs["output_hidden_states"] = (
+            True  # this had already been set in the LORA / PEFT examples
+        )
         kwargs["past_key_values"] = past_key_values
 
-        if self.is_peft_model and self.pretrained_model.active_peft_config.peft_type == "PREFIX_TUNING":
+        if (
+            self.is_peft_model
+            and self.pretrained_model.active_peft_config.peft_type == "PREFIX_TUNING"
+        ):
             kwargs.pop("past_key_values")
 
         base_model_output = self.pretrained_model(
@@ -212,7 +229,9 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
         to the state dictionary of the wrapped model by prepending the key with `v_head.`.
         """
         if not self.is_peft_model:
-            pretrained_model_state_dict = self.pretrained_model.state_dict(*args, **kwargs)
+            pretrained_model_state_dict = self.pretrained_model.state_dict(
+                *args, **kwargs
+            )
         else:
             # if it is a peft model, only save the v_head
             pretrained_model_state_dict = {}
@@ -302,7 +321,9 @@ class AutoModelForSeq2SeqLMWithValueHead(PreTrainedModelWrapper):
         self.is_encoder_decoder = True
 
         if not self._has_lm_head():
-            raise ValueError("The model does not have a language model head, please use a model that has one.")
+            raise ValueError(
+                "The model does not have a language model head, please use a model that has one."
+            )
 
         self.v_head = ValueHead(self.pretrained_model.config, **v_head_kwargs)
 
@@ -375,7 +396,9 @@ class AutoModelForSeq2SeqLMWithValueHead(PreTrainedModelWrapper):
         to the state dictionary of the wrapped model by prepending the key with `v_head.`.
         """
         if not self.is_peft_model:
-            pretrained_model_state_dict = self.pretrained_model.state_dict(*args, **kwargs)
+            pretrained_model_state_dict = self.pretrained_model.state_dict(
+                *args, **kwargs
+            )
         else:
             # if it is a peft model, only save the v_head
             pretrained_model_state_dict = {}
@@ -413,7 +436,10 @@ class AutoModelForSeq2SeqLMWithValueHead(PreTrainedModelWrapper):
         **kwargs,
     ):
         kwargs["past_key_values"] = past_key_values
-        if self.is_peft_model and self.pretrained_model.active_peft_config.peft_type == "PREFIX_TUNING":
+        if (
+            self.is_peft_model
+            and self.pretrained_model.active_peft_config.peft_type == "PREFIX_TUNING"
+        ):
             kwargs.pop("past_key_values")
 
         base_model_output = self.pretrained_model(
