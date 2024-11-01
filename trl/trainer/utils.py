@@ -1174,7 +1174,6 @@ def get_just_reward(
         )
 
     reward_logits = model.score(output.hidden_states[-1]).squeeze(-1)
-    print(query_responses.shape)
 
     # Check if we've produced reward for whole sequence, or value for each token
     if len(reward_logits.shape) == 1:
