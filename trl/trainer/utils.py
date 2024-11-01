@@ -1092,9 +1092,9 @@ def get_reward(
                 The lengths of the sequences in the query responses.
     """
     attention_mask = query_responses != pad_token_id
-    position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     lm_backbone = getattr(model, model.base_model_prefix)
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     output = lm_backbone(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -1114,6 +1114,80 @@ def get_reward(
         ].squeeze(-1),
         sequence_lengths,
     )
+
+
+def get_just_value(
+    model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int
+) -> torch.Tensor:
+    attention_mask = query_responses != pad_token_id
+    lm_backbone = getattr(model, model.base_model_prefix)
+    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+
+    # Wrapping to allow for models which don't use position_ids, e.g. DistilBert
+    # These models also don't have the use_cache kwarg
+    if not hasattr(model, "use_position_ids") or model.use_position_ids:
+        position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
+        output = lm_backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_dict=True,
+            output_hidden_states=True,
+            use_cache=False,  # otherwise mistral-based RM would error out
+        )
+    else:
+        output = lm_backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+            output_hidden_states=True,
+        )
+
+    return model.score(output.hidden_states[-1])
+
+
+def get_just_reward(
+    model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int, context_length: int
+) -> torch.Tensor:
+    attention_mask = query_responses != pad_token_id
+    lm_backbone = getattr(model, model.base_model_prefix)
+    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+
+    # Wrapping to allow for models which don't use position_ids, e.g. DistilBert
+    # These models also don't have the use_cache kwarg
+    if not hasattr(model, "use_position_ids") or model.use_position_ids:
+        position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
+        output = lm_backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_dict=True,
+            output_hidden_states=True,
+            use_cache=False,  # otherwise mistral-based RM would error out
+        )
+    else:
+        output = lm_backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+            output_hidden_states=True,
+        )
+
+    reward_logits = model.score(output.hidden_states[-1]).squeeze(-1)
+
+    # Check if we've produced reward for whole sequence, or value for each token
+    if len(reward_logits.shape) == 1:
+        return reward_logits
+
+    # In latter case we need to get the final value of the sequence
+    else:
+        last_non_pad_tkn_idxs = first_true_indices(
+            query_responses[:, context_length:] == pad_token_id
+        ) - 1 + context_length
+        return reward_logits[
+            torch.arange(reward_logits.size(0), device=reward_logits.device),
+            last_non_pad_tkn_idxs,
+        ]
 
 
 def forward(

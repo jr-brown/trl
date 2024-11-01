@@ -54,7 +54,8 @@ from ..trainer.utils import (
     exact_div,
     first_true_indices,
     forward,
-    get_reward,
+    get_just_value,
+    get_just_reward,
     prepare_deepspeed,
     print_rich_table,
     truncate_response,
@@ -62,9 +63,20 @@ from ..trainer.utils import (
 from .ppo_config import PPOConfig
 from .utils import generate_model_card
 
-
 if is_wandb_available():
     import wandb
+
+
+# Old
+#ProcessingClass = Union[
+#    PreTrainedTokenizerBase,
+#    BaseImageProcessor,
+#    FeatureExtractionMixin,
+#    ProcessorMixin
+#]
+
+# To actually make type checking helpful and not throw errors everywhere
+ProcessingClass = PreTrainedTokenizerBase
 
 
 INVALID_LOGPROB = 1.0
@@ -87,31 +99,33 @@ class PolicyAndValueWrapper(nn.Module):
         return self.policy(**kwargs), logits
 
 
-class LambdaKLACTrainer(Trainer):
+class PPOTrainer(Trainer):
     _tag_names = ["trl", "ppo"]
 
     def __init__(
         self,
         config: PPOConfig,
-        processing_class: Optional[
-            Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]
-        ],
+        processing_class: Optional[ProcessingClass],
         policy: nn.Module,
         ref_policy: nn.Module,
         reward_model: nn.Module,
         train_dataset: Dataset,
         value_model: Optional[nn.Module] = None,
+        reward_model_processing_class: Optional[ProcessingClass]=None,
         data_collator: Optional[DataCollatorWithPadding] = None,
         eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
         # less commonly used
         optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         callbacks: Optional[List[TrainerCallback]] = None,
     ) -> None:
+
         if ref_policy is policy:
             raise ValueError(
                 "`policy` and `ref_policy` cannot be the same object. If you want `ref_policy` to be the "
                 "same as `policy`, you must mass a copy of it, or `None` if you use peft."
             )
+
+        assert processing_class is not None
 
         self.args = config
         args = config
@@ -128,6 +142,7 @@ class LambdaKLACTrainer(Trainer):
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.value_model = value_model
+        self.reward_model_processing_class = reward_model_processing_class
         self.data_collator = data_collator
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
@@ -143,7 +158,7 @@ class LambdaKLACTrainer(Trainer):
         self.accelerator = accelerator
 
         # The number of processes we're using
-        args.world_size = accelerator.num_processes 
+        args.world_size = accelerator.num_processes
         # per_device_train_batch_size
         # gradient_accumulation_steps
         # num_mini_batches
@@ -176,7 +191,7 @@ class LambdaKLACTrainer(Trainer):
             self.sample_generations_freq = max(1, args.num_total_batches // args.num_sample_generations)
         self.local_dataloader_batch_size = args.local_batch_size
 
-        #########
+        #########base_model_uses_position_ids
         # setup model, optimizer, and others
         #########
         for module in [policy, ref_policy, value_model, reward_model]:
@@ -285,6 +300,8 @@ class LambdaKLACTrainer(Trainer):
         ref_policy = self.ref_policy
         reward_model = self.reward_model
         processing_class = self.processing_class
+        assert processing_class is not None
+        reward_model_processing_class = self.reward_model_processing_class
         dataloader = self.dataloader
         device = accelerator.device
 
@@ -417,15 +434,28 @@ class LambdaKLACTrainer(Trainer):
                     # It looks like TRL treates rewards and values the same way. 
                     # We might need our own class for action-value functions.
                     # full_value has shape [batch, query_length, 1]
-                    full_value, _, _ = get_reward(
-                        unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
+
+                    full_value = get_just_value(
+                        unwrapped_value_model, query_response, processing_class.pad_token_id
                     )
                     # Extract only the value estimates for the completion
                     value = full_value[:, context_length - 1 : -1].squeeze(-1)
                     # The score is the reward at the end of each query sequence. 
                     # score has shape [batch]
-                    _, score, _ = get_reward(
-                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    if reward_model_processing_class is None:
+                        reward_model_pad_token = processing_class.pad_token_id
+                        reward_model_inputs = postprocessed_query_response
+                    else:
+                        reward_model_pad_token = reward_model_processing_class.pad_token_id
+                        reward_model_inputs = reward_model_processing_class(
+                            processing_class.batch_decode(postprocessed_query_response),
+                            return_tensors="pt",
+                            truncation=True,
+                            padding="max_length",
+                        )["input_ids"]
+
+                    score = get_just_reward(
+                        reward_model, reward_model_inputs, reward_model_pad_token, context_length
                     )
 
                     # This is just a bunch of logging stuff
@@ -557,7 +587,7 @@ class LambdaKLACTrainer(Trainer):
                             policy_gradient_losses_max = torch.max(policy_gradient_losses_unclipped, policy_gradient_losses_clipped)
                             policy_gradient_loss = masked_mean(policy_gradient_losses_max, ~padding_mask[micro_batch_inds])
                             loss = policy_gradient_loss + args.vf_coef * value_function_loss
-                            
+
                             # Perform the update step. 
                             accelerator.backward(loss)
                             optimizer.step()
@@ -594,7 +624,7 @@ class LambdaKLACTrainer(Trainer):
                     )
                     # fmt: on
                     torch.cuda.empty_cache()
-            
+
             # At the end of training, log a bunch of statistics in the metrics dictionary. 
             with torch.no_grad():
                 mean_kl = kl.sum(1).mean()
@@ -666,6 +696,7 @@ class LambdaKLACTrainer(Trainer):
     def generate_completions(self, sampling: bool = False):
         args = self.args
         processing_class = self.processing_class
+        reward_model_processing_class = self.reward_model_processing_class
         generation_config = GenerationConfig(
             max_new_tokens=self.args.response_length,
             temperature=(0.01 + 1e-7),
@@ -701,8 +732,21 @@ class LambdaKLACTrainer(Trainer):
                     )
 
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    _, score, _ = get_reward(
-                        self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+
+                    if reward_model_processing_class is None:
+                        reward_model_pad_token = processing_class.pad_token_id
+                        reward_model_inputs = postprocessed_query_response
+                    else:
+                        reward_model_pad_token = reward_model_processing_class.pad_token_id
+                        reward_model_inputs = reward_model_processing_class(
+                            processing_class.batch_decode(postprocessed_query_response),
+                            return_tensors="pt",
+                            truncation=True,
+                            padding="max_length",
+                        )["input_ids"]
+
+                    score = get_just_reward(
+                        self.reward_model, reward_model_inputs, reward_model_pad_token, context_length
                     )
                     table["score"].extend(self.accelerator.gather(score).float().cpu().numpy())
 
