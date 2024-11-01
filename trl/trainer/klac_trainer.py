@@ -322,7 +322,7 @@ class LambdaKLACTrainer(Trainer):
         self.state.episode = 0
         self.state.max_steps = args.num_total_batches * args.num_mini_batches
         self.state.num_train_epochs = args.total_episodes / self.train_dataset_len
-        # Compute absolute values for logging, eval, and save if given as ratio
+        # Compute absolute state_values for logging, eval, and save if given as ratio
         if args.logging_steps is not None:
             if args.logging_steps < 1:
                 self.state.logging_steps = math.ceil(self.state.max_steps * args.logging_steps)
@@ -358,7 +358,8 @@ class LambdaKLACTrainer(Trainer):
                 ref_logprobs = []
                 scores = []
                 sequence_lengths = []
-                values = []
+                state_values = []
+                action_values = []
                 with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
                     # query_respones and logitss are both torch Tensors.
                     # query_responses has shape [batch, query_length]
@@ -371,8 +372,8 @@ class LambdaKLACTrainer(Trainer):
                         generation_config,
                     )
 
-                # Note: local_rollout_forward_batch_size gives how many token generation steps we chunk trajectories into.
-                # Iterate through chunks of the queries, moving along by the local_rollout_forward_batch_size each time. 
+                # We break the total batch of generated query-response pairs into chunks of size local_rollout_forward_batch_size. 
+                # local_rollout_forward_batch_size is the number of queries that we process in parallel.
                 for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                     # Extract the query 
                     query = queries[i : i + args.local_rollout_forward_batch_size]
@@ -414,14 +415,18 @@ class LambdaKLACTrainer(Trainer):
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                     sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
-                    # It looks like TRL treates rewards and values the same way. 
+                    # It looks like TRL treates rewards and state_values the same way. 
                     # We might need our own class for action-value functions.
                     # full_value has shape [batch, query_length, 1]
-                    full_value, _, _ = get_reward(
+                    full_state_value, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
                     # Extract only the value estimates for the completion
-                    value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                    state_value = full_state_value[:, context_length - 1 : -1].squeeze(-1)
+
+                    # Computes the action-values.
+                    action_value = args.kl_coef*(logprob - ref_logprob) + state_value
+
                     # The score is the reward at the end of each query sequence. 
                     # score has shape [batch]
                     _, score, _ = get_reward(
@@ -435,18 +440,21 @@ class LambdaKLACTrainer(Trainer):
                     ref_logprobs.append(ref_logprob)
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
-                    values.append(value)
+                    state_values.append(state_value)
+                    action_values.append(action_value)
 
+                # Having processed each chunk of queries, we now have a bunch of sub-chunks of responses.
                 # Now we stack all these sub-chunks together so we can pass them through as one batch. 
-                responses = torch.cat(responses, 0)
+                responses = torch.cat(responses, 0) 
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
                 ref_logprobs = torch.cat(ref_logprobs, 0)
                 sequence_lengths = torch.cat(sequence_lengths, 0)
                 scores = torch.cat(scores, 0)
-                values = torch.cat(values, 0)
+                state_values = torch.cat(state_values, 0)
+                action_values = torch.cat(action_values, 0)
                 # Memory management stuff
-                del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
+                del (logprob, ref_logprob, full_state_value, state_value, action_value, score, unwrapped_model)
                 torch.cuda.empty_cache()
                 gc.collect()
 
@@ -457,48 +465,51 @@ class LambdaKLACTrainer(Trainer):
                     scores[~contain_eos_token] -= self.args.missing_eos_penalty
                 # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
-                # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
+                # be very careful with `padding_mask_plus_one`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
                 response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
                 padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
                 logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
                 ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
-                sequence_lengths_p1 = sequence_lengths + 1
-                padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
-                values = torch.masked_fill(values, padding_mask_p1, 0)
+                sequence_lengths_plus_one = sequence_lengths + 1
+                padding_mask_plus_one = response_idxs > (sequence_lengths_plus_one.unsqueeze(1))
+                state_values = torch.masked_fill(state_values, padding_mask_plus_one, 0)
+                action_values = torch.masked_fill(action_values, padding_mask_plus_one, 0)
 
                 # 4. compute rewards
-                kl = logprobs - ref_logprobs
-                non_score_reward = -args.kl_coef * kl
                 # rewards has shape [batch, response_length]
-                rewards = non_score_reward.clone()
-                actual_start = torch.arange(rewards.size(0), device=rewards.device)
-                actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
-                rewards[[actual_start, actual_end]] += scores
+                rewards = torch.zeros_like(logprobs)
+                batch_indices = torch.arange(rewards.size(0), device=rewards.device) # [0, 1, 2, ..., batch_size - 1]
+                sequence_end_indices = torch.where(sequence_lengths_plus_one < rewards.size(1), sequence_lengths_plus_one, sequence_lengths)
+                rewards[[batch_indices, sequence_end_indices]] += scores
 
                 # 5. whiten rewards
                 if args.whiten_rewards:
-                    rewards = masked_whiten(rewards, mask=~padding_mask_p1, shift_mean=False)
-                    rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
+                    rewards = masked_whiten(rewards, mask=~padding_mask_plus_one, shift_mean=False)
+                    rewards = torch.masked_fill(rewards, padding_mask_plus_one, 0)
 
                 # 6. compute advantages and returns
                 # Initialise the GAE at 0 for the last time step. 
                 lastgaelam = 0
                 advantages_reversed = []
-                gen_length = responses.shape[1]
+                gen_length = responses.shape[1] # This is the length of the responses. 
                 for t in reversed(range(gen_length)):
-                    nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
+                    # Extract the next token state-values
+                    next_state_values = state_values[:, t + 1] if t < gen_length - 1 else 0.0
                     # Compute the TD-error
-                    delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
+                    delta = rewards[:, t] + args.gamma * next_state_values - action_values[:, t]
                     # Use the GAE backwards recursion relationship
                     lastgaelam = delta + args.gamma * args.lam * lastgaelam
                     advantages_reversed.append(lastgaelam)
                 # Create the advantage estimates by reversing the GAE backward recursion
                 advantages = torch.stack(advantages_reversed[::-1], axis=1)
                 # Set the return estimates to be the advantage estimates 
-                returns = advantages + values
+                returns = advantages + state_values
                 # Whiten the advantages. Note that this is *non-optional* and *done at the entire batch level*
-                advantages = masked_whiten(advantages, ~padding_mask)
-                advantages = torch.masked_fill(advantages, padding_mask, 0)
+                # advantages = masked_whiten(advantages, ~padding_mask)
+                # advantages = torch.masked_fill(advantages, padding_mask, 0)
+
+                # We only want the returns, so delete all other variables.
+                del (rewards, lastgaelam, advantages_reversed, delta, next_state_values, advantages)
                 torch.cuda.empty_cache()
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
@@ -517,14 +528,15 @@ class LambdaKLACTrainer(Trainer):
                             micro_batch_end = micro_batch_start + args.per_device_train_batch_size
                             micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
                             # Retrieve the relevant variables for this microbatch
-                            micro_batch_advantage = advantages[micro_batch_inds]
+                            # micro_batch_advantage = advantages[micro_batch_inds]
                             micro_batch_responses = responses[micro_batch_inds]
                             micro_batch_query_responses = query_responses[micro_batch_inds]
                             micro_batch_logprobs = logprobs[micro_batch_inds]
+                            micro_batch_ref_logprobs = ref_logprobs[micro_batch_inds]
                             micro_batch_return = returns[micro_batch_inds]
-                            micro_batch_values = values[micro_batch_inds]
+                            micro_batch_state_values = state_values[micro_batch_inds]
 
-                            output, value_prediction_temp = forward(model, micro_batch_query_responses, processing_class.pad_token_id)
+                            output, state_value_prediction_temporary = forward(model, micro_batch_query_responses, processing_class.pad_token_id)
                             logits = output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
                             new_all_logprobs = F.log_softmax(logits, dim=-1)
@@ -534,32 +546,14 @@ class LambdaKLACTrainer(Trainer):
                             )
 
                             # Compute the value loss term
-                            value_prediction = value_prediction_temp[:, context_length - 1 : -1].squeeze(-1)
-                            value_prediction = torch.masked_fill(value_prediction, padding_mask_p1[micro_batch_inds], 0)
-                            value_prediction_clipped = torch.clamp(
-                                value_prediction,
-                                micro_batch_values - args.cliprange_value,
-                                micro_batch_values + args.cliprange_value,
-                            )
-                            value_function_losses_unclipped = torch.square(value_prediction - micro_batch_return)
-                            value_function_losses_clipped = torch.square(value_prediction_clipped - micro_batch_return)
-                            value_function_loss_max = torch.max(value_function_losses_unclipped, value_function_losses_clipped)
-                            value_function_loss = 0.5 * masked_mean(value_function_loss_max, ~padding_mask_p1[micro_batch_inds])
-                            value_function_clipfrac = masked_mean(
-                                (value_function_losses_clipped > value_function_losses_unclipped).float(), ~padding_mask_p1[micro_batch_inds]
-                            )
-
-                            # Compute the policy gradient loss term. 
-                            logprobs_diff = new_logprobs - micro_batch_logprobs
-                            ratio = torch.exp(logprobs_diff)
-                            policy_gradient_losses_unclipped = -micro_batch_advantage * ratio
-                            policy_gradient_losses_clipped = -micro_batch_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
-                            policy_gradient_losses_max = torch.max(policy_gradient_losses_unclipped, policy_gradient_losses_clipped)
-                            policy_gradient_loss = masked_mean(policy_gradient_losses_max, ~padding_mask[micro_batch_inds])
-                            loss = policy_gradient_loss + args.vf_coef * value_function_loss
-                            
+                            state_value_prediction = state_value_prediction_temporary[:, context_length - 1 : -1].squeeze(-1)
+                            state_value_prediction = torch.masked_fill(state_value_prediction, padding_mask_plus_one[micro_batch_inds], 0)
+                            action_value_prediction = args.kl_coef*(new_logprobs - micro_batch_ref_logprobs) + state_value_prediction
+                            action_value_function_losses = 0.5 * torch.square(action_value_prediction - micro_batch_return)
+                            action_value_function_loss = masked_mean(action_value_function_losses, ~padding_mask_plus_one[micro_batch_inds])
+            
                             # Perform the update step. 
-                            accelerator.backward(loss)
+                            accelerator.backward(action_value_function_loss)
                             optimizer.step()
                             optimizer.zero_grad()
 
@@ -587,10 +581,10 @@ class LambdaKLACTrainer(Trainer):
                     # del everything and empty cache
                     # fmt: off
                     del (
-                        output, value_prediction_temp, logits, new_all_logprobs, new_logprobs, value_prediction, value_prediction_clipped,
+                        output, state_value_prediction_temporary, logits, new_all_logprobs, new_logprobs, value_prediction, value_prediction_clipped,
                         value_function_losses_unclipped, value_function_losses_clipped, value_function_loss, value_function_clipfrac, logprobs_diff, ratio, policy_gradient_losses_clipped, policy_gradient_losses_unclipped, policy_gradient_losses_max,
                         policy_gradient_loss, loss, policy_gradient_clipfrac, prob_dist, entropy, approximate_kl, micro_batch_return,
-                        micro_batch_advantage, micro_batch_values, micro_batch_responses, micro_batch_query_responses, micro_batch_logprobs,
+                        micro_batch_advantage, micro_batch_state_values, micro_batch_responses, micro_batch_query_responses, micro_batch_logprobs,
                     )
                     # fmt: on
                     torch.cuda.empty_cache()
@@ -642,16 +636,16 @@ class LambdaKLACTrainer(Trainer):
                 postprocessed_responses,
                 logprobs,
                 ref_logprobs,
-                values,
+                state_values,
                 sequence_lengths,
                 contain_eos_token,
-                sequence_lengths_p1,
+                sequence_lengths_plus_one,
                 response_idxs,
                 padding_mask,
-                padding_mask_p1,
+                padding_mask_plus_one,
                 rewards,
-                actual_start,
-                actual_end,
+                batch_indices,
+                sequence_end_indices,
                 advantages,
                 returns,
             )
