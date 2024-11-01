@@ -220,7 +220,7 @@ class LambdaKLACTrainer(Trainer):
         # Add tags for models that have been loaded with the correct transformers version
         if hasattr(self.model, "add_model_tags"):
             self.model.add_model_tags(self._tag_names)
-        
+
         #########
         ### setup dataloader
         #########
@@ -441,7 +441,7 @@ class LambdaKLACTrainer(Trainer):
 
                 # Having processed each chunk of queries, we now have a bunch of sub-chunks of responses.
                 # Now we stack all these sub-chunks together so we can pass them through as one batch. 
-                responses = torch.cat(responses, 0) 
+                responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
                 ref_logprobs = torch.cat(ref_logprobs, 0)
@@ -548,7 +548,7 @@ class LambdaKLACTrainer(Trainer):
                             action_value_prediction = args.kl_coef*(log_probs_diff) + state_value_prediction
                             action_value_function_losses = 0.5 * torch.square(action_value_prediction - micro_batch_return)
                             action_value_function_loss = masked_mean(action_value_function_losses, ~padding_mask_plus_one[micro_batch_inds])
-            
+
                             # Perform the update step. 
                             accelerator.backward(action_value_function_loss)
                             optimizer.step()
@@ -577,7 +577,7 @@ class LambdaKLACTrainer(Trainer):
                     )
                     # fmt: on
                     torch.cuda.empty_cache()
-            
+
             # At the end of training, log a bunch of statistics in the metrics dictionary. 
             with torch.no_grad():
                 ### strategy note
@@ -627,10 +627,8 @@ class LambdaKLACTrainer(Trainer):
                 response_idxs,
                 padding_mask,
                 padding_mask_plus_one,
-                rewards,
                 batch_indices,
                 sequence_end_indices,
-                advantages,
                 returns,
             )
             torch.cuda.empty_cache()
@@ -686,6 +684,7 @@ class LambdaKLACTrainer(Trainer):
 
                 if sampling:
                     break
+
         df = pd.DataFrame(table)
 
         if self.accelerator.is_main_process:
