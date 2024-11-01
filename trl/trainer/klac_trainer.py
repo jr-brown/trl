@@ -136,14 +136,14 @@ class LambdaKLACTrainer(Trainer):
         # calculate various batch sizes
         #########
 
-        # One "episode" is one prompt-completion pair 
+        # One "episode" is one prompt-completion pair
         if args.total_episodes is None:  # allow the users to define episodes in terms of epochs.
             args.total_episodes = int(args.num_train_epochs * self.train_dataset_len)
         accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
         self.accelerator = accelerator
 
         # The number of processes we're using
-        args.world_size = accelerator.num_processes 
+        args.world_size = accelerator.num_processes
         # per_device_train_batch_size
         # gradient_accumulation_steps
         # num_mini_batches
@@ -220,7 +220,7 @@ class LambdaKLACTrainer(Trainer):
         # Add tags for models that have been loaded with the correct transformers version
         if hasattr(self.model, "add_model_tags"):
             self.model.add_model_tags(self._tag_names)
-
+        
         #########
         ### setup dataloader
         #########
@@ -309,12 +309,8 @@ class LambdaKLACTrainer(Trainer):
         stats_shape = (args.num_ppo_epochs, args.num_mini_batches, args.gradient_accumulation_steps)
         # Define a collection of tensors which track statistics over training
         approximate_kl_stats = torch.zeros(stats_shape, device=device)
-        policy_gradient_clipfrac_stats = torch.zeros(stats_shape, device=device)
-        policy_gradient_loss_stats = torch.zeros(stats_shape, device=device)
-        value_function_loss_stats = torch.zeros(stats_shape, device=device)
-        value_function_clipfrac_stats = torch.zeros(stats_shape, device=device)
+        action_value_function_loss_stats = torch.zeros(stats_shape, device=device)
         entropy_stats = torch.zeros(stats_shape, device=device)
-        ratio_stats = torch.zeros(stats_shape, device=device)
         model.train()
 
         # trainer state initialization
@@ -427,7 +423,7 @@ class LambdaKLACTrainer(Trainer):
                     # Computes the action-values.
                     action_value = args.kl_coef*(logprob - ref_logprob) + state_value
 
-                    # The score is the reward at the end of each query sequence. 
+                    # The score is the reward at the end of each query sequence.
                     # score has shape [batch]
                     _, score, _ = get_reward(
                         reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
@@ -548,7 +544,8 @@ class LambdaKLACTrainer(Trainer):
                             # Compute the value loss term
                             state_value_prediction = state_value_prediction_temporary[:, context_length - 1 : -1].squeeze(-1)
                             state_value_prediction = torch.masked_fill(state_value_prediction, padding_mask_plus_one[micro_batch_inds], 0)
-                            action_value_prediction = args.kl_coef*(new_logprobs - micro_batch_ref_logprobs) + state_value_prediction
+                            log_probs_diff = new_logprobs - micro_batch_ref_logprobs
+                            action_value_prediction = args.kl_coef*(log_probs_diff) + state_value_prediction
                             action_value_function_losses = 0.5 * torch.square(action_value_prediction - micro_batch_return)
                             action_value_function_loss = masked_mean(action_value_function_losses, ~padding_mask_plus_one[micro_batch_inds])
             
@@ -559,58 +556,45 @@ class LambdaKLACTrainer(Trainer):
 
                             # This is all just for logging. 
                             with torch.no_grad():
-                                policy_gradient_clipfrac = masked_mean(
-                                    (policy_gradient_losses_clipped > policy_gradient_losses_unclipped).float(), ~padding_mask[micro_batch_inds]
-                                )
                                 prob_dist = torch.nn.functional.softmax(logits, dim=-1)
                                 entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
-                                approximate_kl = 0.5 * (logprobs_diff**2).mean()
+                                approximate_kl = 0.5 * (log_probs_diff**2).mean()
                                 approximate_kl_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approximate_kl
-                                policy_gradient_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
-                                    policy_gradient_clipfrac
-                                )
-                                policy_gradient_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = policy_gradient_loss
-                                value_function_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = value_function_loss
-                                value_function_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
-                                    value_function_clipfrac
-                                )
+                                action_value_function_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = action_value_function_loss
+                                # value_function_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
+                                #     value_function_clipfrac
+                                # )
                                 entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
-                                ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
                     # del everything and empty cache
-                    # fmt: off
+                    # fmt: of
                     del (
-                        output, state_value_prediction_temporary, logits, new_all_logprobs, new_logprobs, value_prediction, value_prediction_clipped,
-                        value_function_losses_unclipped, value_function_losses_clipped, value_function_loss, value_function_clipfrac, logprobs_diff, ratio, policy_gradient_losses_clipped, policy_gradient_losses_unclipped, policy_gradient_losses_max,
-                        policy_gradient_loss, loss, policy_gradient_clipfrac, prob_dist, entropy, approximate_kl, micro_batch_return,
-                        micro_batch_advantage, micro_batch_state_values, micro_batch_responses, micro_batch_query_responses, micro_batch_logprobs,
+                        output, state_value_prediction_temporary, logits, new_all_logprobs, new_logprobs, state_value_prediction,
+                        action_value_function_loss, log_probs_diff,
+                        prob_dist, entropy, approximate_kl, micro_batch_return,
+                        micro_batch_state_values, micro_batch_responses, micro_batch_query_responses, micro_batch_logprobs,
                     )
                     # fmt: on
                     torch.cuda.empty_cache()
             
             # At the end of training, log a bunch of statistics in the metrics dictionary. 
             with torch.no_grad():
-                mean_kl = kl.sum(1).mean()
+                ### strategy note
+                ### for today will comment out difficult logging and next time will return and improve
                 mean_entropy = (-logprobs).sum(1).mean()
-                mean_non_score_reward = non_score_reward.sum(1).mean()
-                rlhf_reward = mean_non_score_reward + scores.mean()
+                #rlhf_reward = mean_non_score_reward + scores.mean()
                 eps = int(self.state.episode / (time.time() - start_time))
                 metrics = {}
                 metrics["eps"] = eps
-                metrics["objective/kl"] = self.accelerator.gather(mean_kl).mean().item()
+                # metrics["objective/kl"] = self.accelerator.gather(mean_kl).mean().item()
                 metrics["objective/entropy"] = self.accelerator.gather(mean_entropy).mean().item()
-                metrics["objective/non_score_reward"] = self.accelerator.gather(mean_non_score_reward).mean().item()
-                metrics["objective/rlhf_reward"] = self.accelerator.gather(rlhf_reward).mean().item()
+                # metrics["objective/non_score_reward"] = self.accelerator.gather(mean_non_score_reward).mean().item()
+                # metrics["objective/rlhf_reward"] = self.accelerator.gather(rlhf_reward).mean().item()
                 metrics["objective/scores"] = self.accelerator.gather(scores.mean()).mean().item()
                 metrics["policy/approximate_kl_avg"] = self.accelerator.gather(approximate_kl_stats).mean().item()
-                metrics["policy/clipfrac_avg"] = self.accelerator.gather(policy_gradient_clipfrac_stats).mean().item()
-                metrics["loss/policy_avg"] = self.accelerator.gather(policy_gradient_loss_stats).mean().item()
-                metrics["loss/value_avg"] = self.accelerator.gather(value_function_loss_stats).mean().item()
-                metrics["val/clipfrac_avg"] = self.accelerator.gather(value_function_clipfrac_stats).mean().item()
+                metrics["loss/value_avg"] = self.accelerator.gather(action_value_function_loss_stats).mean().item()
                 metrics["policy/entropy_avg"] = self.accelerator.gather(entropy_stats).mean().item()
-                metrics["val/ratio"] = self.accelerator.gather(ratio_stats).mean().item()
-                metrics["val/ratio_var"] = self.accelerator.gather(ratio_stats).var().item()
                 metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
@@ -623,7 +607,7 @@ class LambdaKLACTrainer(Trainer):
             if self.control.should_save:
                 self._save_checkpoint(model, trial=None, metrics=metrics)
                 self.control = self.callback_handler.on_save(self.args, self.state, self.control)
-            del kl, mean_kl, mean_entropy, mean_non_score_reward, scores, metrics, non_score_reward
+            del mean_entropy, scores, metrics # mean_kl, mean_non_score_reward, 
             torch.cuda.empty_cache()
             gc.collect()
 
