@@ -43,6 +43,7 @@ _import_structure = {
         "RandomPairwiseJudge",
         "RandomRankJudge",
     ],
+    "klac_trainer": ["LambdaKLACTrainer"],
     "kto_config": ["KTOConfig"],
     "kto_trainer": ["KTOTrainer"],
     "model_config": ["ModelConfig"],

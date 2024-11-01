@@ -80,6 +80,7 @@ _import_structure = {
         "PairRMJudge",
         "PPOConfig",
         "PPOTrainer",
+        "LambdaKLACTrainer",
         "PPOv2Config",
         "PPOv2Trainer",
         "RandomPairwiseJudge",
