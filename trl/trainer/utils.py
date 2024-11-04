@@ -1116,6 +1116,25 @@ def get_reward(
     )
 
 
+def retokenize(
+    input_ids: torch.Tensor,
+    device,
+    source_processing_class: PreTrainedTokenizerBase,
+    target_processing_class: PreTrainedTokenizerBase | None = None,
+) -> tuple[torch.Tensor, int | None]:
+    if target_processing_class is None:
+        return input_ids, source_processing_class.pad_token_id
+    else:
+        new_inputs = target_processing_class(
+            source_processing_class.batch_decode(input_ids),
+            return_tensors="pt",
+            truncation=True,
+            padding="max_length",
+        )["input_ids"]
+        new_inputs = new_inputs.to(device)
+        return new_inputs, target_processing_class.pad_token_id
+
+
 def get_just_value(
     model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int
 ) -> torch.Tensor:

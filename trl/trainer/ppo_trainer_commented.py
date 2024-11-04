@@ -58,6 +58,7 @@ from ..trainer.utils import (
     exact_div,
     first_true_indices,
     forward,
+    retokenize,
     get_just_value,
     get_just_reward,
     prepare_deepspeed,
@@ -523,21 +524,12 @@ class PPOTrainer(Trainer):
                     value = full_value[:, context_length - 1 : -1].squeeze(-1)
                     # The score is the reward at the end of each query sequence.
                     # score has shape [batch]
-                    if reward_model_processing_class is None:
-                        reward_model_pad_token = processing_class.pad_token_id
-                        reward_model_inputs = postprocessed_query_response
-                    else:
-                        reward_model_pad_token = (
-                            reward_model_processing_class.pad_token_id
-                        )
-                        reward_model_inputs = reward_model_processing_class(
-                            processing_class.batch_decode(postprocessed_query_response),
-                            return_tensors="pt",
-                            truncation=True,
-                            padding="max_length",
-                        )["input_ids"]
-
-                    reward_model_inputs = reward_model_inputs.to(device)
+                    reward_model_inputs, reward_model_pad_token = retokenize(
+                        postprocessed_query_response,
+                        device,
+                        processing_class,
+                        reward_model_processing_class,
+                    )
 
                     score = get_just_reward(
                         reward_model,
@@ -977,22 +969,11 @@ class PPOTrainer(Trainer):
                         (query, postprocessed_response), 1
                     )
 
-                    if reward_model_processing_class is None:
-                        reward_model_pad_token = processing_class.pad_token_id
-                        reward_model_inputs = postprocessed_query_response
-                    else:
-                        reward_model_pad_token = (
-                            reward_model_processing_class.pad_token_id
-                        )
-                        reward_model_inputs = reward_model_processing_class(
-                            processing_class.batch_decode(postprocessed_query_response),
-                            return_tensors="pt",
-                            truncation=True,
-                            padding="max_length",
-                        )["input_ids"]
-
-                    reward_model_inputs = reward_model_inputs.to(
-                        self.accelerator.device
+                    reward_model_inputs, reward_model_pad_token = retokenize(
+                        postprocessed_query_response,
+                        self.accelerator.device,
+                        processing_class,
+                        reward_model_processing_class,
                     )
 
                     score = get_just_reward(
