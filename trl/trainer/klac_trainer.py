@@ -88,7 +88,7 @@ class PolicyAndValueWrapper(nn.Module):
 
 
 class LambdaKLACTrainer(Trainer):
-    _tag_names = ["trl", "ppo"]
+    _tag_names = ["trl", "KLQ"]
 
     def __init__(
         self,
@@ -308,9 +308,17 @@ class LambdaKLACTrainer(Trainer):
         # gradient_accumulation_steps
         stats_shape = (args.num_ppo_epochs, args.num_mini_batches, args.gradient_accumulation_steps)
         # Define a collection of tensors which track statistics over training
-        approximate_kl_stats = torch.zeros(stats_shape, device=device)
-        action_value_function_loss_stats = torch.zeros(stats_shape, device=device)
+        loss_function_stats = torch.zeros(stats_shape, device=device)
+        action_value_stats = torch.zeros(stats_shape, device=device)
+        state_value_stats = torch.zeros(stats_shape, device=device)
+        log_ratio_new_ref_stats = torch.zeros(stats_shape, device=device)
         entropy_stats = torch.zeros(stats_shape, device=device)
+        kl_prev_ref_stats = torch.zeros(stats_shape, device=device)
+        kl_new_ref_stats = torch.zeros(stats_shape, device=device)
+        kl_prev_new_stats = torch.zeros(stats_shape, device=device)
+        kl_new_prev_stats = torch.zeros(stats_shape, device=device)
+
+        # Put the model into train mode. 
         model.train()
 
         # trainer state initialization
@@ -485,7 +493,7 @@ class LambdaKLACTrainer(Trainer):
 
                 # 6. compute advantages and returns
                 # Initialise the GAE at 0 for the last time step. 
-                lastgaelam = 0
+                last_gae = 0
                 advantages_reversed = []
                 gen_length = responses.shape[1] # This is the length of the responses. 
                 for t in reversed(range(gen_length)):
@@ -494,23 +502,25 @@ class LambdaKLACTrainer(Trainer):
                     # Compute the TD-error
                     delta = rewards[:, t] + args.gamma * next_state_values - action_values[:, t]
                     # Use the GAE backwards recursion relationship
-                    lastgaelam = delta + args.gamma * args.lam * lastgaelam
-                    advantages_reversed.append(lastgaelam)
+                    last_gae = delta + args.gamma * args.lam * last_gae
+                    advantages_reversed.append(last_gae)
                 # Create the advantage estimates by reversing the GAE backward recursion
                 advantages = torch.stack(advantages_reversed[::-1], axis=1)
                 # Set the return estimates to be the advantage estimates 
                 returns = advantages + state_values
+                returns = torch.masked_fill(returns, padding_mask_plus_one, 0) # BUGHOTSPOT
+
                 # Whiten the advantages. Note that this is *non-optional* and *done at the entire batch level*
                 # advantages = masked_whiten(advantages, ~padding_mask)
                 # advantages = torch.masked_fill(advantages, padding_mask, 0)
 
                 # We only want the returns, so delete all other variables.
-                del (rewards, lastgaelam, advantages_reversed, delta, next_state_values, advantages)
+                del (rewards, last_gae, advantages_reversed, delta, next_state_values, advantages)
                 torch.cuda.empty_cache()
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
             # num_ppo_epochs specifies how many times to loop over the PPO dataset. 
-            for ppo_epoch_idx in range(args.num_ppo_epochs):
+            for klq_epoch_idx in range(args.num_ppo_epochs):
                 # Draw a random permutation 
                 batch_inds = np.random.permutation(args.local_batch_size)
                 minibatch_idx = 0
@@ -524,10 +534,9 @@ class LambdaKLACTrainer(Trainer):
                             micro_batch_end = micro_batch_start + args.per_device_train_batch_size
                             micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
                             # Retrieve the relevant variables for this microbatch
-                            # micro_batch_advantage = advantages[micro_batch_inds]
                             micro_batch_responses = responses[micro_batch_inds]
                             micro_batch_query_responses = query_responses[micro_batch_inds]
-                            micro_batch_logprobs = logprobs[micro_batch_inds]
+                            micro_batch_prev_logprobs = logprobs[micro_batch_inds]
                             micro_batch_ref_logprobs = ref_logprobs[micro_batch_inds]
                             micro_batch_return = returns[micro_batch_inds]
                             micro_batch_state_values = state_values[micro_batch_inds]
@@ -544,8 +553,8 @@ class LambdaKLACTrainer(Trainer):
                             # Compute the value loss term
                             state_value_prediction = state_value_prediction_temporary[:, context_length - 1 : -1].squeeze(-1)
                             state_value_prediction = torch.masked_fill(state_value_prediction, padding_mask_plus_one[micro_batch_inds], 0)
-                            log_probs_diff = new_logprobs - micro_batch_ref_logprobs
-                            action_value_prediction = args.kl_coef*(log_probs_diff) + state_value_prediction
+                            new_ref_log_ratio = new_logprobs - micro_batch_ref_logprobs
+                            action_value_prediction = args.kl_coef*(new_ref_log_ratio) + state_value_prediction
                             action_value_function_losses = 0.5 * torch.square(action_value_prediction - micro_batch_return)
                             action_value_function_loss = masked_mean(action_value_function_losses, ~padding_mask_plus_one[micro_batch_inds])
 
@@ -556,48 +565,87 @@ class LambdaKLACTrainer(Trainer):
 
                             # This is all just for logging. 
                             with torch.no_grad():
+                                loss_function_stats[klq_epoch_idx, minibatch_idx, gradient_accumulation_idx] = action_value_function_loss.mean()
+                                action_value_stats[klq_epoch_idx, minibatch_idx, gradient_accumulation_idx] = action_value_prediction.mean()
+                                state_value_stats[klq_epoch_idx, minibatch_idx, gradient_accumulation_idx] = state_value_prediction.mean()
+                                log_ratio_new_ref_stats[klq_epoch_idx, minibatch_idx, gradient_accumulation_idx] = new_ref_log_ratio.mean()
+
                                 prob_dist = torch.nn.functional.softmax(logits, dim=-1)
                                 entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
-                                approximate_kl = 0.5 * (log_probs_diff**2).mean()
-                                approximate_kl_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approximate_kl
-                                action_value_function_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = action_value_function_loss
-                                # value_function_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
-                                #     value_function_clipfrac
-                                # )
-                                entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
+                                entropy_stats[klq_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
+                                
+                                prev_new_log_ratio = micro_batch_prev_logprobs - new_logprobs
+                                prev_ref_log_ratio = micro_batch_prev_logprobs - ref_logprobs
+                                new_prev_log_ratio = -prev_new_log_ratio
+                                new_prev_ratio = torch.exp(new_prev_log_ratio)
+                                kl_prev_ref_stats[klq_epoch_idx, minibatch_idx, gradient_accumulation_idx] = prev_ref_log_ratio.mean()
+                                kl_new_ref_stats[klq_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (new_prev_ratio * new_ref_log_ratio).mean()
+                                kl_prev_new_stats[klq_epoch_idx, minibatch_idx, gradient_accumulation_idx] = prev_new_log_ratio.mean()
+                                kl_new_prev_stats[klq_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (new_prev_ratio * new_prev_log_ratio).mean()
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
                     # del everything and empty cache
                     # fmt: of
                     del (
-                        output, state_value_prediction_temporary, logits, new_all_logprobs, new_logprobs, state_value_prediction,
-                        action_value_function_loss, log_probs_diff,
-                        prob_dist, entropy, approximate_kl, micro_batch_return,
-                        micro_batch_state_values, micro_batch_responses, micro_batch_query_responses, micro_batch_logprobs,
+                        # del all of the micro-batch variables
+                        micro_batch_responses, micro_batch_query_responses, micro_batch_prev_logprobs, micro_batch_ref_logprobs, micro_batch_return, micro_batch_state_values,
+                        # del all variables used to compute the loss
+                        output, state_value_prediction_temporary, logits, new_all_logprobs, new_logprobs, 
+                        state_value_prediction, new_ref_log_ratio, action_value_prediction, action_value_function_losses, action_value_function_loss,
+                        # del all variables used for logging
+                        prob_dist, entropy, prev_new_log_ratio, prev_ref_log_ratio, new_prev_log_ratio, new_prev_ratio                  
                     )
                     # fmt: on
                     torch.cuda.empty_cache()
 
             # At the end of training, log a bunch of statistics in the metrics dictionary. 
             with torch.no_grad():
-                ### strategy note
-                ### for today will comment out difficult logging and next time will return and improve
                 mean_entropy = (-logprobs).sum(1).mean()
-                #rlhf_reward = mean_non_score_reward + scores.mean()
+                
                 eps = int(self.state.episode / (time.time() - start_time))
                 metrics = {}
+                # These are metrics related to tracking time and episodes
                 metrics["eps"] = eps
-                # metrics["objective/kl"] = self.accelerator.gather(mean_kl).mean().item()
-                metrics["objective/entropy"] = self.accelerator.gather(mean_entropy).mean().item()
-                # metrics["objective/non_score_reward"] = self.accelerator.gather(mean_non_score_reward).mean().item()
-                # metrics["objective/rlhf_reward"] = self.accelerator.gather(rlhf_reward).mean().item()
-                metrics["objective/scores"] = self.accelerator.gather(scores.mean()).mean().item()
-                metrics["policy/approximate_kl_avg"] = self.accelerator.gather(approximate_kl_stats).mean().item()
-                metrics["loss/value_avg"] = self.accelerator.gather(action_value_function_loss_stats).mean().item()
-                metrics["policy/entropy_avg"] = self.accelerator.gather(entropy_stats).mean().item()
-                metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
+                
+                # These are metrics related to the KLQ objective
+                metrics["objective/scores"] = self.accelerator.gather(scores.mean()).mean().item()
+                metrics["objective/kl_prev_ref"] = self.accelerator.gather(kl_prev_ref_stats).mean().item()
+                metrics["objective/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
+                
+                # These are metrics related to the loss used to train KLQ
+                metrics["loss/avg_value_loss"] = self.accelerator.gather(loss_function_stats).mean().item()
+                metrics["loss/avg_target_values"] = returns.mean().item()
+                metrics["loss/var_target_values"] = returns.var().item()
+                
+                # These are metrics related to the value function and its components
+                metrics["value_function/avg_state_value"] = self.accelerator.gather(state_value_stats).mean().item()     
+                metrics["value_function/avg_action_value"] = self.accelerator.gather(action_value_stats).mean().item()
+                metrics["value_function/avg_log_ratio"] = self.accelerator.gather(log_ratio_new_ref_stats).mean().item()
+                
+                ## These are commented out because it's non-trivial to compute variances of these quantities.
+                # metrics["value_function/var_state_value"] = HOLDING
+                # metrics["value_function/var_action_value"] = HOLDING  
+                # metrics["value_function/var_log_ratio"] = HOLDING
+                
+                ## These are commented out because at the moment we are not clipping the value function at all. 
+                # metrics["value_function/action_value_clip_frac"] = HOLDING
+                # metrics["value_function/log_ratio_clip_frac"] = HOLDING
+
+                # These are metrics related to the policy
+                metrics["policy/entropy"] = self.accelerator.gather(entropy_stats).mean().item()
+                metrics["policy/kl_new_prev"] = self.accelerator.gather(kl_new_prev_stats).mean().item()
+                metrics["policy/kl_prev_new"] = self.accelerator.gather(kl_prev_new_stats).mean().item()
+                metrics["policy/kl_new_ref"] = self.accelerator.gather(kl_new_ref_stats).mean().item()
+
+                # These are metrics used by PPO but not by us. 
+                # metrics["objective/kl"] = self.accelerator.gather(mean_kl).mean().item()
+                # metrics["objective/non_score_reward"] = self.accelerator.gather(mean_non_score_reward).mean().item()
+                # metrics["objective/rlhf_reward"] = self.accelerator.gather(rlhf_reward).mean().item()
+                # metrics["policy/approximate_kl_avg"] = self.accelerator.gather(approximate_kl_stats).mean().item()
+                # metrics["policy/entropy_avg"] = self.accelerator.gather(entropy_stats).mean().item()
+                
                 self.state.epoch = self.state.episode / self.train_dataset_len  # used by self.log
                 self.state.global_step += 1
                 self.log(metrics)
