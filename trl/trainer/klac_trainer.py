@@ -18,7 +18,7 @@ import os
 import textwrap
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable
 
 import numpy as np
 import pandas as pd
@@ -84,6 +84,20 @@ ProcessingClass = PreTrainedTokenizerBase
 INVALID_LOGPROB = 1.0
 
 
+def standard_loss_fn(kl_coef, state_value_prediction, new_ref_log_ratio, micro_batch_return):
+    action_value_prediction = kl_coef*(new_ref_log_ratio) + state_value_prediction
+    return 0.5 * torch.square(action_value_prediction - micro_batch_return)
+
+
+
+loss_function_map: dict[
+    str,
+    Callable[[float, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+] = {
+    "standard": standard_loss_fn,
+}
+
+
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
 # we did this we can do a single `model = accelerator.prepare(model)`
 class PolicyAndValueWrapper(nn.Module):
@@ -119,6 +133,7 @@ class LambdaKLACTrainer(Trainer):
         # less commonly used
         optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         callbacks: Optional[List[TrainerCallback]] = None,
+        loss_function: str = "standard",
     ) -> None:
         if ref_policy is policy:
             raise ValueError(
@@ -145,6 +160,7 @@ class LambdaKLACTrainer(Trainer):
         self.data_collator = data_collator
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
+        self.loss_function = loss_function
 
         #########
         # calculate various batch sizes
@@ -577,13 +593,22 @@ class LambdaKLACTrainer(Trainer):
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )
 
-                            # Compute the value loss term
+                            # Compute inputs to loss function
                             state_value_prediction = state_value_prediction_temporary[:, context_length - 1 : -1].squeeze(-1)
                             state_value_prediction = torch.masked_fill(state_value_prediction, padding_mask_plus_one[micro_batch_inds], 0)
                             new_ref_log_ratio = new_logprobs - micro_batch_ref_logprobs
-                            action_value_prediction = args.kl_coef*(new_ref_log_ratio) + state_value_prediction
-                            action_value_function_losses = 0.5 * torch.square(action_value_prediction - micro_batch_return)
-                            action_value_function_loss = masked_mean(action_value_function_losses, ~padding_mask_plus_one[micro_batch_inds])
+
+                            # Compute loss
+                            action_value_function_loss = loss_function_map[self.loss_function](
+                                args.kl_coef,
+                                state_value_prediction,
+                                new_ref_log_ratio,
+                                micro_batch_return,
+                            )
+                            action_value_function_losses = masked_mean(
+                                action_value_function_losses,
+                                ~padding_mask_plus_one[micro_batch_inds]
+                            )
 
                             # Perform the update step. 
                             accelerator.backward(action_value_function_loss)
@@ -600,7 +625,7 @@ class LambdaKLACTrainer(Trainer):
                                 prob_dist = torch.nn.functional.softmax(logits, dim=-1)
                                 entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
                                 entropy_stats[klq_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
-                                
+
                                 prev_new_log_ratio = micro_batch_prev_logprobs - new_logprobs
                                 prev_ref_log_ratio = micro_batch_prev_logprobs - ref_logprobs
                                 new_prev_log_ratio = -prev_new_log_ratio
