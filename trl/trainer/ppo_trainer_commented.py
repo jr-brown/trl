@@ -530,7 +530,6 @@ class PPOTrainer(Trainer):
                         processing_class,
                         reward_model_processing_class,
                     )
-
                     score = get_just_reward(
                         reward_model,
                         reward_model_inputs,
@@ -968,14 +967,12 @@ class PPOTrainer(Trainer):
                     postprocessed_query_response = torch.cat(
                         (query, postprocessed_response), 1
                     )
-
                     reward_model_inputs, reward_model_pad_token = retokenize(
                         postprocessed_query_response,
                         self.accelerator.device,
                         processing_class,
                         reward_model_processing_class,
                     )
-
                     score = get_just_reward(
                         self.reward_model,
                         reward_model_inputs,

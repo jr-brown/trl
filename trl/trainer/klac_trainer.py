@@ -54,7 +54,9 @@ from ..trainer.utils import (
     exact_div,
     first_true_indices,
     forward,
-    get_reward,
+    retokenize,
+    get_just_value,
+    get_just_reward,
     prepare_deepspeed,
     print_rich_table,
     truncate_response,
@@ -65,6 +67,18 @@ from .utils import generate_model_card
 
 if is_wandb_available():
     import wandb
+
+
+# Old
+# ProcessingClass = Union[
+#    PreTrainedTokenizerBase,
+#    BaseImageProcessor,
+#    FeatureExtractionMixin,
+#    ProcessorMixin
+# ]
+
+# To actually make type checking helpful and not throw errors everywhere
+ProcessingClass = PreTrainedTokenizerBase
 
 
 INVALID_LOGPROB = 1.0
@@ -93,14 +107,13 @@ class LambdaKLACTrainer(Trainer):
     def __init__(
         self,
         config: PPOConfig,
-        processing_class: Optional[
-            Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]
-        ],
+        processing_class: Optional[ProcessingClass],
         policy: nn.Module,
         ref_policy: nn.Module,
         reward_model: nn.Module,
         train_dataset: Dataset,
         value_model: Optional[nn.Module] = None,
+        reward_model_processing_class: Optional[ProcessingClass] = None,
         data_collator: Optional[DataCollatorWithPadding] = None,
         eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
         # less commonly used
@@ -128,6 +141,7 @@ class LambdaKLACTrainer(Trainer):
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.value_model = value_model
+        self.reward_model_processing_class = reward_model_processing_class
         self.data_collator = data_collator
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
@@ -285,6 +299,8 @@ class LambdaKLACTrainer(Trainer):
         ref_policy = self.ref_policy
         reward_model = self.reward_model
         processing_class = self.processing_class
+        assert processing_class is not None
+        reward_model_processing_class = self.reward_model_processing_class
         dataloader = self.dataloader
         device = accelerator.device
 
@@ -422,8 +438,10 @@ class LambdaKLACTrainer(Trainer):
                     # It looks like TRL treates rewards and state_values the same way. 
                     # We might need our own class for action-value functions.
                     # full_value has shape [batch, query_length, 1]
-                    full_state_value, _, _ = get_reward(
-                        unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
+                    full_state_value = get_just_value(
+                        unwrapped_value_model,
+                        query_response,
+                        processing_class.pad_token_id,
                     )
                     # Extract only the value estimates for the completion
                     state_value = full_state_value[:, context_length - 1 : -1].squeeze(-1)
@@ -433,8 +451,17 @@ class LambdaKLACTrainer(Trainer):
 
                     # The score is the reward at the end of each query sequence.
                     # score has shape [batch]
-                    _, score, _ = get_reward(
-                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    reward_model_inputs, reward_model_pad_token = retokenize(
+                        postprocessed_query_response,
+                        device,
+                        processing_class,
+                        reward_model_processing_class,
+                    )
+                    score = get_just_reward(
+                        reward_model,
+                        reward_model_inputs,
+                        reward_model_pad_token,
+                        context_length,
                     )
 
                     # This is just a bunch of logging stuff
@@ -690,6 +717,7 @@ class LambdaKLACTrainer(Trainer):
     def generate_completions(self, sampling: bool = False):
         args = self.args
         processing_class = self.processing_class
+        reward_model_processing_class = self.reward_model_processing_class
         generation_config = GenerationConfig(
             max_new_tokens=self.args.response_length,
             temperature=(0.01 + 1e-7),
@@ -725,8 +753,17 @@ class LambdaKLACTrainer(Trainer):
                     )
 
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    _, score, _ = get_reward(
-                        self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    reward_model_inputs, reward_model_pad_token = retokenize(
+                        postprocessed_query_response,
+                        self.accelerator.device,
+                        processing_class,
+                        reward_model_processing_class,
+                    )
+                    score = get_just_reward(
+                        self.reward_model,
+                        reward_model_inputs,
+                        reward_model_pad_token,
+                        context_length,
                     )
                     table["score"].extend(self.accelerator.gather(score).float().cpu().numpy())
 
