@@ -711,8 +711,8 @@ class PPOTrainer(Trainer):
 
         accelerator.print("===training policy===")
         start_time = time.time()
-        # num_ppo_epochs is the number of epochs for which we train on the PPO dataset for each increment of PPO
-        # num_mini_batches
+        # num_ppo_epochs is the number of epochs for which we train on each PPO dataset for each increment of PPO
+        # num_mini_batches 
         # gradient_accumulation_steps
         stats_shape = (
             args.num_ppo_epochs,
@@ -766,6 +766,7 @@ class PPOTrainer(Trainer):
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
 
+            # Generate a PPO dataset for this update phase
             with torch.no_grad():
                 queries = data["input_ids"].to(device)
 
@@ -873,7 +874,8 @@ class PPOTrainer(Trainer):
                 advantages = torch.masked_fill(advantages, padding_mask, 0)
                 torch.cuda.empty_cache()
 
-            # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
+            # Do multiple epochs of PPO training, using the dataset for this update phase
+            # use a fresh random shuffle in each epoch
             # num_ppo_epochs specifies how many times to loop over the PPO dataset.
             for ppo_epoch_idx in range(args.num_ppo_epochs):
                 # Draw a random permutation
@@ -905,7 +907,7 @@ class PPOTrainer(Trainer):
                     )
                     torch.cuda.empty_cache()
 
-            # At the end of training, log a bunch of statistics in the metrics dictionary.
+            # At the end of the update phase, log a bunch of statistics in the metrics dictionary.
             with torch.no_grad():
                 mean_kl = kl.sum(1).mean()
                 mean_entropy = (-logprobs).sum(1).mean()
@@ -914,44 +916,28 @@ class PPOTrainer(Trainer):
                 eps = int(self.state.episode / (time.time() - start_time))
                 metrics = {}
                 metrics["eps"] = eps
-                metrics["objective/kl"] = self.accelerator.gather(mean_kl).mean().item()
-                metrics["objective/entropy"] = (
-                    self.accelerator.gather(mean_entropy).mean().item()
-                )
-                metrics["objective/non_score_reward"] = (
-                    self.accelerator.gather(mean_non_score_reward).mean().item()
-                )
-                metrics["objective/rlhf_reward"] = (
-                    self.accelerator.gather(rlhf_reward).mean().item()
-                )
-                metrics["objective/scores"] = (
-                    self.accelerator.gather(scores.mean()).mean().item()
-                )
-                metrics["policy/approximate_kl_avg"] = (
-                    self.accelerator.gather(approximate_kl_stats).mean().item()
-                )
-                metrics["policy/clipfrac_avg"] = (
-                    self.accelerator.gather(policy_gradient_clipfrac_stats)
-                    .mean()
-                    .item()
-                )
-                metrics["loss/policy_avg"] = (
-                    self.accelerator.gather(policy_gradient_loss_stats).mean().item()
-                )
-                metrics["loss/value_avg"] = (
-                    self.accelerator.gather(value_function_loss_stats).mean().item()
-                )
-                metrics["val/clipfrac_avg"] = (
-                    self.accelerator.gather(value_function_clipfrac_stats).mean().item()
-                )
-                metrics["policy/entropy_avg"] = (
-                    self.accelerator.gather(entropy_stats).mean().item()
-                )
-                metrics["val/ratio"] = (
-                    self.accelerator.gather(ratio_stats).mean().item()
-                )
+
+                # Refactor the metric caching to make it easier to parse
+                s = ppo_stats
+                mean_metric_update_specification = {
+                    'objective/kl': mean_kl,
+                    'objective/entropy': mean_entropy,
+                    'objective/non_score_reward': mean_non_score_reward,
+                    'objective/rlhf_reward': rlhf_reward,
+                    'objective/scores': scores.mean(),
+                    'policy/approximate_kl_avg': s.approximate_kl_stats,
+                    'policy/clipfrac_avg': s.policy_gradient_clipfrac_stats,
+                    'loss/policy_avg': s.policy_gradient_loss_stats,
+                    'loss/value_avg': s.value_function_loss_stats,
+                    'val/clipfrac_avg': s.value_function_clipfrac_stats,
+                    'policy/entropy_avg': s.entropy_stats,
+                    'val/ratio': s.ratio_stats,
+                }
+                for m_name, m_tensor in mean_metric_update_specification.items():
+                    metrics[m_name] = self.accelerator.gather(m_tensor).mean().item()
+
                 metrics["val/ratio_var"] = (
-                    self.accelerator.gather(ratio_stats).var().item()
+                    self.accelerator.gather(s.ratio_stats).var().item()
                 )
                 metrics["val/num_eos_tokens"] = (
                     (responses == processing_class.eos_token_id).sum().item()
