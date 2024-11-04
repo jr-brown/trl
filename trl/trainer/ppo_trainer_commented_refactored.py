@@ -241,10 +241,57 @@ def forward_rollout(
         values,
     )
 
+class PPOStats:
+    def __init__(self, stats_shape: Tuple[int, int, int], device: torch.device):
+        self.approximate_kl_stats = torch.zeros(stats_shape, device=device)
+        self.policy_gradient_clipfrac_stats = torch.zeros(stats_shape, device=device)
+        self.policy_gradient_loss_stats = torch.zeros(stats_shape, device=device)
+        self.value_function_loss_stats = torch.zeros(stats_shape, device=device)
+        self.value_function_clipfrac_stats = torch.zeros(stats_shape, device=device)
+        self.entropy_stats = torch.zeros(stats_shape, device=device)
+        self.ratio_stats = torch.zeros(stats_shape, device=device)
+
+    def update(
+        self, 
+        update_location: Tuple[int, int, int],
+        approximate_kl_mean: torch.Tensor,
+        policy_gradient_clipfrac: torch.Tensor,
+        policy_gradient_loss: torch.Tensor,
+        value_function_loss: torch.Tensor,
+        value_function_clipfrac: torch.Tensor,
+        entropy_mean: torch.Tensor,
+        ratio_mean: torch.Tensor,
+    ):
+        self.approximate_kl_stats[update_location] = approximate_kl_mean
+        self.policy_gradient_clipfrac_stats[update_location] = policy_gradient_clipfrac
+        self.policy_gradient_loss_stats[update_location] = policy_gradient_loss
+        self.value_function_loss_stats[update_location] = value_function_loss
+        self.value_function_clipfrac_stats[update_location] = value_function_clipfrac
+        self.entropy_stats[update_location] = entropy_mean
+        self.ratio_stats[update_location] = ratio_mean
+        
+            
 
 def ppo_micro_batch_updates(
+    args: PPOConfig,
     ppo_epoch_idx,
     minibatch_idx,
+    mini_batch_start: int,
+    model,
+    advantages,
+    responses,
+    query_responses,
+    logprobs,
+    returns,
+    values,
+    padding_mask,
+    padding_mask_p1,
+    context_length: int,
+    pad_token_id: int,
+    batch_inds: np.ndarray,
+    accelerator: Accelerator,
+    optimizer,
+    stats: PPOStats,
 ):
     mini_batch_end = mini_batch_start + args.local_mini_batch_size
     mini_batch_inds = batch_inds[mini_batch_start:mini_batch_end]
@@ -273,7 +320,7 @@ def ppo_micro_batch_updates(
             output, value_prediction_temp = forward(
                 model,
                 micro_batch_query_responses,
-                processing_class.pad_token_id,
+                pad_token_id,
             )
             logits = output.logits[:, context_length - 1 : -1]
             logits /= args.temperature + 1e-7
@@ -365,41 +412,22 @@ def ppo_micro_batch_updates(
                     prob_dist * logits, dim=-1
                 )
                 approximate_kl = 0.5 * (logprobs_diff**2).mean()
-                approximate_kl_stats[
+                # create a slice object for the indices that we want to populate
+                update_location = (
                     ppo_epoch_idx,
                     minibatch_idx,
                     gradient_accumulation_idx,
-                ] = approximate_kl
-                policy_gradient_clipfrac_stats[
-                    ppo_epoch_idx,
-                    minibatch_idx,
-                    gradient_accumulation_idx,
-                ] = policy_gradient_clipfrac
-                policy_gradient_loss_stats[
-                    ppo_epoch_idx,
-                    minibatch_idx,
-                    gradient_accumulation_idx,
-                ] = policy_gradient_loss
-                value_function_loss_stats[
-                    ppo_epoch_idx,
-                    minibatch_idx,
-                    gradient_accumulation_idx,
-                ] = value_function_loss
-                value_function_clipfrac_stats[
-                    ppo_epoch_idx,
-                    minibatch_idx,
-                    gradient_accumulation_idx,
-                ] = value_function_clipfrac
-                entropy_stats[
-                    ppo_epoch_idx,
-                    minibatch_idx,
-                    gradient_accumulation_idx,
-                ] = entropy.mean()
-                ratio_stats[
-                    ppo_epoch_idx,
-                    minibatch_idx,
-                    gradient_accumulation_idx,
-                ] = ratio.mean()
+                )
+                stats.update(
+                    update_location,
+                    approximate_kl,
+                    policy_gradient_clipfrac,
+                    policy_gradient_loss,
+                    value_function_loss,
+                    value_function_clipfrac,
+                    entropy.mean(),
+                    ratio.mean(),
+                )
         gradient_accumulation_idx += 1
 
 
@@ -691,14 +719,10 @@ class PPOTrainer(Trainer):
             args.num_mini_batches,
             args.gradient_accumulation_steps,
         )
-        # Define a collection of tensors which track statistics over training
-        approximate_kl_stats = torch.zeros(stats_shape, device=device)
-        policy_gradient_clipfrac_stats = torch.zeros(stats_shape, device=device)
-        policy_gradient_loss_stats = torch.zeros(stats_shape, device=device)
-        value_function_loss_stats = torch.zeros(stats_shape, device=device)
-        value_function_clipfrac_stats = torch.zeros(stats_shape, device=device)
-        entropy_stats = torch.zeros(stats_shape, device=device)
-        ratio_stats = torch.zeros(stats_shape, device=device)
+
+        # Lightweight wrapper for a collection of tensors which track statistics over training
+        ppo_stats = PPOStats(stats_shape, device)
+
         model.train()
 
         # trainer state initialization
@@ -858,8 +882,26 @@ class PPOTrainer(Trainer):
                     0, args.local_batch_size, args.local_mini_batch_size
                 )):
                     _ = ppo_micro_batch_updates(
-                        ppo_epoch_idx,
-                        minibatch_idx,
+                        args=args,
+                        ppo_epoch_idx=ppo_epoch_idx,
+                        minibatch_idx=minibatch_idx,
+                        mini_batch_start=mini_batch_start,
+                        model=model,
+                        advantages=advantages,
+                        responses=responses,
+                        query_responses=query_responses,
+                        logprobs=logprobs,
+                        returns=returns,
+                        values=values,
+                        padding_mask=padding_mask,
+                        padding_mask_p1=padding_mask_p1,
+                        context_length=processing_class.context_length,
+                        pad_token_id=processing_class.pad_token_id,
+                        batch_inds=batch_inds,
+                        # parameters that feel more 'stateful'
+                        accelerator=accelerator,
+                        optimizer=optimizer,
+                        stats=ppo_stats,
                     )
                     torch.cuda.empty_cache()
 
