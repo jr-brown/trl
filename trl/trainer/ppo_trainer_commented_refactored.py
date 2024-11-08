@@ -87,6 +87,36 @@ ProcessingClass = PreTrainedTokenizerBase
 INVALID_LOGPROB = 1.0
 
 
+class PPOStats:
+    def __init__(self, stats_shape: Tuple[int, int, int], device: torch.device):
+        self.approximate_kl_stats = torch.zeros(stats_shape, device=device)
+        self.policy_gradient_clipfrac_stats = torch.zeros(stats_shape, device=device)
+        self.policy_gradient_loss_stats = torch.zeros(stats_shape, device=device)
+        self.value_function_loss_stats = torch.zeros(stats_shape, device=device)
+        self.value_function_clipfrac_stats = torch.zeros(stats_shape, device=device)
+        self.entropy_stats = torch.zeros(stats_shape, device=device)
+        self.ratio_stats = torch.zeros(stats_shape, device=device)
+
+    def update(
+        self,
+        update_location: Tuple[int, int, int],
+        approximate_kl_mean: torch.Tensor,
+        policy_gradient_clipfrac: torch.Tensor,
+        policy_gradient_loss: torch.Tensor,
+        value_function_loss: torch.Tensor,
+        value_function_clipfrac: torch.Tensor,
+        entropy_mean: torch.Tensor,
+        ratio_mean: torch.Tensor,
+    ):
+        self.approximate_kl_stats[update_location] = approximate_kl_mean
+        self.policy_gradient_clipfrac_stats[update_location] = policy_gradient_clipfrac
+        self.policy_gradient_loss_stats[update_location] = policy_gradient_loss
+        self.value_function_loss_stats[update_location] = value_function_loss
+        self.value_function_clipfrac_stats[update_location] = value_function_clipfrac
+        self.entropy_stats[update_location] = entropy_mean
+        self.ratio_stats[update_location] = ratio_mean
+
+
 def calc_logprob(idx: int, response: torch.Tensor, logitss: torch.Tensor, local_rollout_forward_batch_size: int):
     # Get the logits for all tokens at each step of the generation.
     logits = logitss[idx : idx + local_rollout_forward_batch_size]
@@ -128,13 +158,13 @@ def forward_rollout(
     reward_model,
     processing_class,
     reward_model_processing_class,
+    context_length,
     pad_token_id,
     stop_token_id,
     local_rollout_forward_batch_size,
     temperature,
     device,
 ):
-    context_length = queries.shape[1]
     responses = []
     postprocessed_responses = []
     logprobs = []
@@ -241,36 +271,6 @@ def forward_rollout(
         values,
     )
 
-class PPOStats:
-    def __init__(self, stats_shape: Tuple[int, int, int], device: torch.device):
-        self.approximate_kl_stats = torch.zeros(stats_shape, device=device)
-        self.policy_gradient_clipfrac_stats = torch.zeros(stats_shape, device=device)
-        self.policy_gradient_loss_stats = torch.zeros(stats_shape, device=device)
-        self.value_function_loss_stats = torch.zeros(stats_shape, device=device)
-        self.value_function_clipfrac_stats = torch.zeros(stats_shape, device=device)
-        self.entropy_stats = torch.zeros(stats_shape, device=device)
-        self.ratio_stats = torch.zeros(stats_shape, device=device)
-
-    def update(
-        self, 
-        update_location: Tuple[int, int, int],
-        approximate_kl_mean: torch.Tensor,
-        policy_gradient_clipfrac: torch.Tensor,
-        policy_gradient_loss: torch.Tensor,
-        value_function_loss: torch.Tensor,
-        value_function_clipfrac: torch.Tensor,
-        entropy_mean: torch.Tensor,
-        ratio_mean: torch.Tensor,
-    ):
-        self.approximate_kl_stats[update_location] = approximate_kl_mean
-        self.policy_gradient_clipfrac_stats[update_location] = policy_gradient_clipfrac
-        self.policy_gradient_loss_stats[update_location] = policy_gradient_loss
-        self.value_function_loss_stats[update_location] = value_function_loss
-        self.value_function_clipfrac_stats[update_location] = value_function_clipfrac
-        self.entropy_stats[update_location] = entropy_mean
-        self.ratio_stats[update_location] = ratio_mean
-        
-            
 
 def ppo_micro_batch_updates(
     args: PPOConfig,
@@ -296,6 +296,7 @@ def ppo_micro_batch_updates(
     mini_batch_end = mini_batch_start + args.local_mini_batch_size
     mini_batch_inds = batch_inds[mini_batch_start:mini_batch_end]
     gradient_accumulation_idx = 0
+
     for micro_batch_start in range(
         0, args.local_mini_batch_size, args.per_device_train_batch_size
     ):
@@ -429,6 +430,200 @@ def ppo_micro_batch_updates(
                     ratio.mean(),
                 )
         gradient_accumulation_idx += 1
+
+
+def ppo_batch_update(
+    model,
+    ref_policy,
+    reward_model,
+    data,
+    accelerator,
+    processing_class,
+    reward_model_processing_class,
+    args,
+    generation_config,
+    device,
+    optimizer,
+    ppo_stats,
+):
+    # Generate a PPO dataset for this update phase
+    with torch.no_grad():
+        queries = data["input_ids"].to(device)
+        context_length = queries.shape[1]
+
+        with unwrap_model_for_generation(
+            model, accelerator
+        ) as unwrapped_model:
+            # query_respones and logitss are both torch Tensors.
+            # query_responses has shape [batch, query_length]
+            # logitss has shape [batch, response_length, vocabulary size]
+            query_responses, logitss = batch_generation(
+                unwrapped_model.policy,
+                queries,
+                args.local_rollout_forward_batch_size,
+                processing_class.pad_token_id,
+                generation_config,
+            )
+
+        (
+            responses,
+            postprocessed_responses,
+            logprobs,
+            ref_logprobs,
+            sequence_lengths,
+            scores,
+            values,
+        ) = forward_rollout(
+            queries=queries,
+            query_responses=query_responses,
+            logitss=logitss,
+            ref_policy=ref_policy,
+            unwrapped_value_model=accelerator.unwrap_model(model).value_model,
+            reward_model=reward_model,
+            processing_class=processing_class,
+            reward_model_processing_class=reward_model_processing_class,
+            context_length=context_length,
+            pad_token_id=processing_class.pad_token_id,
+            stop_token_id=args.stop_token_id,
+            local_rollout_forward_batch_size=args.local_rollout_forward_batch_size,
+            temperature=args.temperature,
+            device=device,
+        )
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
+        # Completions not passing that filter will receive a lower score.
+        contain_eos_token = torch.any(
+            postprocessed_responses == processing_class.eos_token_id,
+            dim=-1,
+        )
+        if args.missing_eos_penalty is not None:
+            scores[~contain_eos_token] -= args.missing_eos_penalty
+        # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
+
+        # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
+        response_idxs = torch.arange(
+            responses.shape[1], device=responses.device
+        ).repeat(responses.shape[0], 1)
+        padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
+        logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
+        ref_logprobs = torch.masked_fill(
+            ref_logprobs, padding_mask, INVALID_LOGPROB
+        )
+        sequence_lengths_p1 = sequence_lengths + 1
+        padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
+        values = torch.masked_fill(values, padding_mask_p1, 0)
+
+        # 4. compute rewards
+        kl = logprobs - ref_logprobs
+        non_score_reward = -args.kl_coef * kl
+        # rewards has shape [batch, response_length]
+        rewards = non_score_reward.clone()
+        actual_start = torch.arange(rewards.size(0), device=rewards.device)
+        actual_end = torch.where(
+            sequence_lengths_p1 < rewards.size(1),
+            sequence_lengths_p1,
+            sequence_lengths,
+        )
+        rewards[[actual_start, actual_end]] += scores
+
+        # 5. whiten rewards
+        if args.whiten_rewards:
+            rewards = masked_whiten(
+                rewards, mask=~padding_mask_p1, shift_mean=False
+            )
+            rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
+
+        # 6. compute advantages and returns
+        # Initialise the GAE at 0 for the last time step.
+        lastgaelam = 0
+        advantages_reversed = []
+        gen_length = responses.shape[1]
+        for t in reversed(range(gen_length)):
+            nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
+            # Compute the TD-error
+            delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
+            # Use the GAE backwards recursion relationship
+            lastgaelam = delta + args.gamma * args.lam * lastgaelam
+            advantages_reversed.append(lastgaelam)
+        # Create the advantage estimates by reversing the GAE backward recursion
+        advantages = torch.stack(advantages_reversed[::-1], axis=1)
+        # Set the return estimates to be the advantage estimates
+        returns = advantages + values
+        # Whiten the advantages. Note that this is *non-optional* and *done at the entire batch level*
+        advantages = masked_whiten(advantages, ~padding_mask)
+        advantages = torch.masked_fill(advantages, padding_mask, 0)
+        torch.cuda.empty_cache()
+
+    # Do multiple epochs of PPO training, using the dataset for this update phase
+    # use a fresh random shuffle in each epoch
+    # num_ppo_epochs specifies how many times to loop over the PPO dataset.
+    for ppo_epoch_idx in range(args.num_ppo_epochs):
+        # Draw a random permutation
+        batch_inds = np.random.permutation(args.local_batch_size)
+        for minibatch_idx, mini_batch_start in enumerate(range(
+            0, args.local_batch_size, args.local_mini_batch_size
+        )):
+            ppo_micro_batch_updates(
+                args=args,
+                ppo_epoch_idx=ppo_epoch_idx,
+                minibatch_idx=minibatch_idx,
+                mini_batch_start=mini_batch_start,
+                advantages=advantages,
+                responses=responses,
+                query_responses=query_responses,
+                logprobs=logprobs,
+                returns=returns,
+                values=values,
+                padding_mask=padding_mask,
+                padding_mask_p1=padding_mask_p1,
+                context_length=context_length,
+                pad_token_id=processing_class.pad_token_id,
+                batch_inds=batch_inds,
+                # Stateful parameters that get updated
+                model=model,
+                accelerator=accelerator,
+                optimizer=optimizer,
+                stats=ppo_stats,
+            )
+            torch.cuda.empty_cache()
+
+    # At the end of the update phase, log a bunch of statistics in the metrics dictionary.
+    with torch.no_grad():
+        mean_kl = kl.sum(1).mean()
+        mean_entropy = (-logprobs).sum(1).mean()
+        mean_non_score_reward = non_score_reward.sum(1).mean()
+        rlhf_reward = mean_non_score_reward + scores.mean()
+        metrics = {}
+
+        # Refactor the metric caching to make it easier to parse
+        s = ppo_stats
+        mean_metric_update_specification = {
+            'objective/kl': mean_kl,
+            'objective/entropy': mean_entropy,
+            'objective/non_score_reward': mean_non_score_reward,
+            'objective/rlhf_reward': rlhf_reward,
+            'objective/scores': scores.mean(),
+            'policy/approximate_kl_avg': s.approximate_kl_stats,
+            'policy/clipfrac_avg': s.policy_gradient_clipfrac_stats,
+            'loss/policy_avg': s.policy_gradient_loss_stats,
+            'loss/value_avg': s.value_function_loss_stats,
+            'val/clipfrac_avg': s.value_function_clipfrac_stats,
+            'policy/entropy_avg': s.entropy_stats,
+            'val/ratio': s.ratio_stats,
+        }
+        for m_name, m_tensor in mean_metric_update_specification.items():
+            metrics[m_name] = accelerator.gather(m_tensor).mean().item()
+
+        metrics["val/ratio_var"] = (
+            accelerator.gather(s.ratio_stats).var().item()
+        )
+        metrics["val/num_eos_tokens"] = (
+            (responses == processing_class.eos_token_id).sum().item()
+        )
+
+    return model, metrics
 
 
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
@@ -765,191 +960,29 @@ class PPOTrainer(Trainer):
         for update in range(1, args.num_total_batches + 1):
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
-
-            # Generate a PPO dataset for this update phase
-            with torch.no_grad():
-                queries = data["input_ids"].to(device)
-
-                with unwrap_model_for_generation(
-                    model, self.accelerator
-                ) as unwrapped_model:
-                    # query_respones and logitss are both torch Tensors.
-                    # query_responses has shape [batch, query_length]
-                    # logitss has shape [batch, response_length, vocabulary size]
-                    query_responses, logitss = batch_generation(
-                        unwrapped_model.policy,
-                        queries,
-                        args.local_rollout_forward_batch_size,
-                        processing_class.pad_token_id,
-                        generation_config,
-                    )
-
-                (
-                    responses,
-                    postprocessed_responses,
-                    logprobs,
-                    ref_logprobs,
-                    sequence_lengths,
-                    scores,
-                    values,
-                ) = forward_rollout(
-                    queries,
-                    query_responses,
-                    logitss,
-                    ref_policy,
-                    accelerator.unwrap_model(model).value_model,
-                    reward_model,
-                    processing_class,
-                    reward_model_processing_class,
-                    processing_class.pad_token_id,
-                    args.stop_token_id,
-                    args.local_rollout_forward_batch_size,
-                    args.temperature,
-                    device,
-                )
-                torch.cuda.empty_cache()
-                gc.collect()
-
-                # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
-                # Completions not passing that filter will receive a lower score.
-                contain_eos_token = torch.any(
-                    postprocessed_responses == self.processing_class.eos_token_id,
-                    dim=-1,
-                )
-                if self.args.missing_eos_penalty is not None:
-                    scores[~contain_eos_token] -= self.args.missing_eos_penalty
-                # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
-
-                # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
-                response_idxs = torch.arange(
-                    responses.shape[1], device=responses.device
-                ).repeat(responses.shape[0], 1)
-                padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
-                logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-                ref_logprobs = torch.masked_fill(
-                    ref_logprobs, padding_mask, INVALID_LOGPROB
-                )
-                sequence_lengths_p1 = sequence_lengths + 1
-                padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
-                values = torch.masked_fill(values, padding_mask_p1, 0)
-
-                # 4. compute rewards
-                kl = logprobs - ref_logprobs
-                non_score_reward = -args.kl_coef * kl
-                # rewards has shape [batch, response_length]
-                rewards = non_score_reward.clone()
-                actual_start = torch.arange(rewards.size(0), device=rewards.device)
-                actual_end = torch.where(
-                    sequence_lengths_p1 < rewards.size(1),
-                    sequence_lengths_p1,
-                    sequence_lengths,
-                )
-                rewards[[actual_start, actual_end]] += scores
-
-                # 5. whiten rewards
-                if args.whiten_rewards:
-                    rewards = masked_whiten(
-                        rewards, mask=~padding_mask_p1, shift_mean=False
-                    )
-                    rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
-
-                # 6. compute advantages and returns
-                # Initialise the GAE at 0 for the last time step.
-                lastgaelam = 0
-                advantages_reversed = []
-                gen_length = responses.shape[1]
-                for t in reversed(range(gen_length)):
-                    nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
-                    # Compute the TD-error
-                    delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
-                    # Use the GAE backwards recursion relationship
-                    lastgaelam = delta + args.gamma * args.lam * lastgaelam
-                    advantages_reversed.append(lastgaelam)
-                # Create the advantage estimates by reversing the GAE backward recursion
-                advantages = torch.stack(advantages_reversed[::-1], axis=1)
-                # Set the return estimates to be the advantage estimates
-                returns = advantages + values
-                # Whiten the advantages. Note that this is *non-optional* and *done at the entire batch level*
-                advantages = masked_whiten(advantages, ~padding_mask)
-                advantages = torch.masked_fill(advantages, padding_mask, 0)
-                torch.cuda.empty_cache()
-
-            # Do multiple epochs of PPO training, using the dataset for this update phase
-            # use a fresh random shuffle in each epoch
-            # num_ppo_epochs specifies how many times to loop over the PPO dataset.
-            for ppo_epoch_idx in range(args.num_ppo_epochs):
-                # Draw a random permutation
-                batch_inds = np.random.permutation(args.local_batch_size)
-                for minibatch_idx, mini_batch_start in enumerate(range(
-                    0, args.local_batch_size, args.local_mini_batch_size
-                )):
-                    _ = ppo_micro_batch_updates(
-                        args=args,
-                        ppo_epoch_idx=ppo_epoch_idx,
-                        minibatch_idx=minibatch_idx,
-                        mini_batch_start=mini_batch_start,
-                        model=model,
-                        advantages=advantages,
-                        responses=responses,
-                        query_responses=query_responses,
-                        logprobs=logprobs,
-                        returns=returns,
-                        values=values,
-                        padding_mask=padding_mask,
-                        padding_mask_p1=padding_mask_p1,
-                        context_length=processing_class.context_length,
-                        pad_token_id=processing_class.pad_token_id,
-                        batch_inds=batch_inds,
-                        # parameters that feel more 'stateful'
-                        accelerator=accelerator,
-                        optimizer=optimizer,
-                        stats=ppo_stats,
-                    )
-                    torch.cuda.empty_cache()
-
-            # At the end of the update phase, log a bunch of statistics in the metrics dictionary.
-            with torch.no_grad():
-                mean_kl = kl.sum(1).mean()
-                mean_entropy = (-logprobs).sum(1).mean()
-                mean_non_score_reward = non_score_reward.sum(1).mean()
-                rlhf_reward = mean_non_score_reward + scores.mean()
-                eps = int(self.state.episode / (time.time() - start_time))
-                metrics = {}
-                metrics["eps"] = eps
-
-                # Refactor the metric caching to make it easier to parse
-                s = ppo_stats
-                mean_metric_update_specification = {
-                    'objective/kl': mean_kl,
-                    'objective/entropy': mean_entropy,
-                    'objective/non_score_reward': mean_non_score_reward,
-                    'objective/rlhf_reward': rlhf_reward,
-                    'objective/scores': scores.mean(),
-                    'policy/approximate_kl_avg': s.approximate_kl_stats,
-                    'policy/clipfrac_avg': s.policy_gradient_clipfrac_stats,
-                    'loss/policy_avg': s.policy_gradient_loss_stats,
-                    'loss/value_avg': s.value_function_loss_stats,
-                    'val/clipfrac_avg': s.value_function_clipfrac_stats,
-                    'policy/entropy_avg': s.entropy_stats,
-                    'val/ratio': s.ratio_stats,
-                }
-                for m_name, m_tensor in mean_metric_update_specification.items():
-                    metrics[m_name] = self.accelerator.gather(m_tensor).mean().item()
-
-                metrics["val/ratio_var"] = (
-                    self.accelerator.gather(s.ratio_stats).var().item()
-                )
-                metrics["val/num_eos_tokens"] = (
-                    (responses == processing_class.eos_token_id).sum().item()
-                )
-                metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
-                metrics["episode"] = self.state.episode
-                self.state.epoch = (
-                    self.state.episode / self.train_dataset_len
-                )  # used by self.log
-                self.state.global_step += 1
-                self.log(metrics)
-
+            model, metrics = ppo_batch_update(
+                model=model,
+                ref_policy=ref_policy,
+                reward_model=reward_model,
+                data=data,
+                accelerator=accelerator,
+                processing_class=processing_class,
+                reward_model_processing_class=reward_model_processing_class,
+                args=args,
+                generation_config=generation_config,
+                device=device,
+                optimizer=optimizer,
+                ppo_stats=ppo_stats,
+            )
+            eps = int(self.state.episode / (time.time() - start_time))
+            metrics["eps"] = eps
+            metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
+            metrics["episode"] = self.state.episode
+            self.state.epoch = (
+                self.state.episode / self.train_dataset_len
+            )  # used by self.log
+            self.state.global_step += 1
+            self.log(metrics)
             self.lr_scheduler.step()
             self.control = self.callback_handler.on_step_end(
                 args, self.state, self.control
@@ -959,15 +992,6 @@ class PPOTrainer(Trainer):
                 self.control = self.callback_handler.on_save(
                     self.args, self.state, self.control
                 )
-            del (
-                kl,
-                mean_kl,
-                mean_entropy,
-                mean_non_score_reward,
-                scores,
-                metrics,
-                non_score_reward,
-            )
             torch.cuda.empty_cache()
             gc.collect()
 
@@ -977,26 +1001,6 @@ class PPOTrainer(Trainer):
             ):
                 self.generate_completions(sampling=True)
                 torch.cuda.empty_cache()
-            del (
-                query_responses,
-                responses,
-                postprocessed_responses,
-                logprobs,
-                ref_logprobs,
-                values,
-                sequence_lengths,
-                contain_eos_token,
-                sequence_lengths_p1,
-                response_idxs,
-                padding_mask,
-                padding_mask_p1,
-                rewards,
-                actual_start,
-                actual_end,
-                advantages,
-                returns,
-            )
-            torch.cuda.empty_cache()
 
         # HF trainer specifics
         self.control = self.callback_handler.on_train_end(
