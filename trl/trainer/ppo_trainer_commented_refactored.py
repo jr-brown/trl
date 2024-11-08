@@ -262,18 +262,21 @@ def ppo_micro_batch_updates(
 
 
 def ppo_batch_update(
+    config,
+    generation_config,
+    processing_class,
+    reward_model_processing_class,
+    # GPU related things
+    device: torch.device,
+    accelerator,
+    optimizer,
+    # stateful parameters
     model,
     ref_policy,
     reward_model,
-    data,
-    accelerator,
-    processing_class,
-    reward_model_processing_class,
-    config,
-    generation_config,
-    device,
-    optimizer,
     ppo_stats,
+    # data for this batch
+    data,
 ):
     # Generate a PPO dataset for this update phase
     with torch.no_grad():
@@ -404,6 +407,7 @@ def ppo_batch_update(
                 context_length=context_length,
                 pad_token_id=processing_class.pad_token_id,
                 # tensors
+                batch_inds=batch_inds,
                 advantages=advantages,
                 responses=responses,
                 query_responses=query_responses,
@@ -412,7 +416,6 @@ def ppo_batch_update(
                 state_values=state_values,
                 padding_mask=padding_mask,
                 padding_mask_plus_one=padding_mask_plus_one,
-                batch_inds=batch_inds,
                 # Stateful parameters that get updated
                 model=model,
                 accelerator=accelerator,
@@ -431,7 +434,7 @@ def ppo_batch_update(
 
         # Refactor the metric caching to make it easier to parse
         s = ppo_stats
-        mean_metric_update_specification = {
+        metrics_gathered_and_meaned = {
             'objective/kl': mean_kl,
             'objective/entropy': mean_entropy,
             'objective/non_score_reward': mean_non_score_reward,
@@ -445,12 +448,10 @@ def ppo_batch_update(
             'policy/entropy_avg': s.entropy_stats,
             'val/ratio': s.ratio_stats,
         }
-        for m_name, m_tensor in mean_metric_update_specification.items():
+        for m_name, m_tensor in metrics_gathered_and_meaned.items():
             metrics[m_name] = accelerator.gather(m_tensor).mean().item()
 
-        metrics["val/ratio_var"] = (
-            accelerator.gather(s.ratio_stats).var().item()
-        )
+        metrics["val/ratio_var"] = accelerator.gather(s.ratio_stats).var().item()
         metrics["val/num_eos_tokens"] = (
             (responses == processing_class.eos_token_id).sum().item()
         )
