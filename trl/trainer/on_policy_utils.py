@@ -138,7 +138,7 @@ def forward_rollout(
     ref_logprobs = []
     scores = []
     sequence_lengths = []
-    values = []
+    state_values = []
 
     # Note: local_rollout_forward_batch_size gives how many token generation steps we chunk trajectories into.
     # Iterate through chunks of the queries, moving along by the local_rollout_forward_batch_size each time.
@@ -194,7 +194,7 @@ def forward_rollout(
             pad_token_id,
         )
         # Extract only the value estimates for the completion
-        value = full_value[:, context_length - 1 : -1].squeeze(-1)
+        state_value = full_value[:, context_length - 1 : -1].squeeze(-1)
         # The score is the reward at the end of each query sequence.
         # score has shape [batch]
         reward_model_inputs, reward_model_pad_token = retokenize(
@@ -217,7 +217,7 @@ def forward_rollout(
         ref_logprobs.append(ref_logprob)
         sequence_lengths.append(sequence_length)
         scores.append(score)
-        values.append(value)
+        state_values.append(state_value)
 
     # Now we stack all these sub-chunks together so we can pass them through as one batch.
     responses = torch.cat(responses, 0)
@@ -226,7 +226,7 @@ def forward_rollout(
     ref_logprobs = torch.cat(ref_logprobs, 0)
     sequence_lengths = torch.cat(sequence_lengths, 0)
     scores = torch.cat(scores, 0)
-    values = torch.cat(values, 0)
+    state_values = torch.cat(state_values, 0)
 
     return (
         responses,
@@ -235,6 +235,6 @@ def forward_rollout(
         ref_logprobs,
         sequence_lengths,
         scores,
-        values,
+        state_values,
     )
 

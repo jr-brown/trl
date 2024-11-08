@@ -523,7 +523,7 @@ class KLQTrainer(Trainer):
                     last_gae = delta + config.gamma * config.lam * last_gae
                     advantages_reversed.append(last_gae)
                 # Create the advantage estimates by reversing the GAE backward recursion
-                advantages = torch.stack(advantages_reversed[::-1], axis=1)
+                advantages = torch.stack(advantages_reversed[::-1], dim=1)
                 # Set the return estimates to be the advantage estimates
                 returns = advantages + state_values
                 returns = torch.masked_fill(returns, padding_mask_plus_one, 0) # BUGHOTSPOT

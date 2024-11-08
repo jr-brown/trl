@@ -91,16 +91,16 @@ class PPOStats:
         approximate_kl_mean: torch.Tensor,
         policy_gradient_clipfrac: torch.Tensor,
         policy_gradient_loss: torch.Tensor,
-        value_function_loss: torch.Tensor,
-        value_function_clipfrac: torch.Tensor,
+        state_value_function_loss: torch.Tensor,
+        state_value_function_clipfrac: torch.Tensor,
         entropy_mean: torch.Tensor,
         ratio_mean: torch.Tensor,
     ):
         self.approximate_kl_stats[update_location] = approximate_kl_mean
         self.policy_gradient_clipfrac_stats[update_location] = policy_gradient_clipfrac
         self.policy_gradient_loss_stats[update_location] = policy_gradient_loss
-        self.value_function_loss_stats[update_location] = value_function_loss
-        self.value_function_clipfrac_stats[update_location] = value_function_clipfrac
+        self.value_function_loss_stats[update_location] = state_value_function_loss
+        self.value_function_clipfrac_stats[update_location] = state_value_function_clipfrac
         self.entropy_stats[update_location] = entropy_mean
         self.ratio_stats[update_location] = ratio_mean
 
@@ -116,9 +116,9 @@ def ppo_micro_batch_updates(
     query_responses,
     logprobs,
     returns,
-    values,
+    state_values,
     padding_mask,
-    padding_mask_p1,
+    padding_mask_plus_one,
     context_length: int,
     pad_token_id: int,
     batch_inds: np.ndarray,
@@ -149,9 +149,9 @@ def ppo_micro_batch_updates(
             ]
             micro_batch_logprobs = logprobs[micro_batch_inds]
             micro_batch_return = returns[micro_batch_inds]
-            micro_batch_values = values[micro_batch_inds]
+            micro_batch_state_values = state_values[micro_batch_inds]
 
-            output, value_prediction_temp = forward(
+            output, state_value_prediction_temp = forward(
                 model,
                 micro_batch_query_responses,
                 pad_token_id,
@@ -169,37 +169,37 @@ def ppo_micro_batch_updates(
             )
 
             # Compute the value loss term
-            value_prediction = value_prediction_temp[
+            state_value_prediction = state_value_prediction_temp[
                 :, context_length - 1 : -1
             ].squeeze(-1)
-            value_prediction = torch.masked_fill(
-                value_prediction, padding_mask_p1[micro_batch_inds], 0
+            state_value_prediction = torch.masked_fill(
+                state_value_prediction, padding_mask_plus_one[micro_batch_inds], 0
             )
-            value_prediction_clipped = torch.clamp(
-                value_prediction,
-                micro_batch_values - config.cliprange_value,
-                micro_batch_values + config.cliprange_value,
+            state_value_prediction_clipped = torch.clamp(
+                state_value_prediction,
+                micro_batch_state_values - config.cliprange_value,
+                micro_batch_state_values + config.cliprange_value,
             )
-            value_function_losses_unclipped = torch.square(
-                value_prediction - micro_batch_return
+            state_value_function_losses_unclipped = torch.square(
+                state_value_prediction - micro_batch_return
             )
-            value_function_losses_clipped = torch.square(
-                value_prediction_clipped - micro_batch_return
+            state_value_function_losses_clipped = torch.square(
+                state_value_prediction_clipped - micro_batch_return
             )
-            value_function_loss_max = torch.max(
-                value_function_losses_unclipped,
-                value_function_losses_clipped,
+            state_value_function_loss_max = torch.max(
+                state_value_function_losses_unclipped,
+                state_value_function_losses_clipped,
             )
-            value_function_loss = 0.5 * masked_mean(
-                value_function_loss_max,
-                ~padding_mask_p1[micro_batch_inds],
+            state_value_function_loss = 0.5 * masked_mean(
+                state_value_function_loss_max,
+                ~padding_mask_plus_one[micro_batch_inds],
             )
-            value_function_clipfrac = masked_mean(
+            state_value_function_clipfrac = masked_mean(
                 (
-                    value_function_losses_clipped
-                    > value_function_losses_unclipped
+                    state_value_function_losses_clipped
+                    > state_value_function_losses_unclipped
                 ).float(),
-                ~padding_mask_p1[micro_batch_inds],
+                ~padding_mask_plus_one[micro_batch_inds],
             )
 
             # Compute the policy gradient loss term.
@@ -224,7 +224,7 @@ def ppo_micro_batch_updates(
             )
             loss = (
                 policy_gradient_loss
-                + config.vf_coef * value_function_loss
+                + config.vf_coef * state_value_function_loss
             )
 
             # Perform the update step.
@@ -257,8 +257,8 @@ def ppo_micro_batch_updates(
                     approximate_kl,
                     policy_gradient_clipfrac,
                     policy_gradient_loss,
-                    value_function_loss,
-                    value_function_clipfrac,
+                    state_value_function_loss,
+                    state_value_function_clipfrac,
                     entropy.mean(),
                     ratio.mean(),
                 )
@@ -305,7 +305,7 @@ def ppo_batch_update(
             ref_logprobs,
             sequence_lengths,
             scores,
-            values,
+            state_values,
         ) = forward_rollout(
             queries=queries,
             query_responses=query_responses,
@@ -344,46 +344,46 @@ def ppo_batch_update(
         ref_logprobs = torch.masked_fill(
             ref_logprobs, padding_mask, INVALID_LOGPROB
         )
-        sequence_lengths_p1 = sequence_lengths + 1
-        padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
-        values = torch.masked_fill(values, padding_mask_p1, 0)
+        sequence_lengths_plus_one = sequence_lengths + 1
+        padding_mask_plus_one = response_idxs > (sequence_lengths_plus_one.unsqueeze(1))
+        state_values = torch.masked_fill(state_values, padding_mask_plus_one, 0)
 
         # 4. compute rewards
         kl = logprobs - ref_logprobs
         non_score_reward = -config.kl_coef * kl
         # rewards has shape [batch, response_length]
         rewards = non_score_reward.clone()
-        actual_start = torch.arange(rewards.size(0), device=rewards.device)
-        actual_end = torch.where(
-            sequence_lengths_p1 < rewards.size(1),
-            sequence_lengths_p1,
+        batch_indices = torch.arange(rewards.size(0), device=rewards.device)
+        sequence_end_indices = torch.where(
+            sequence_lengths_plus_one < rewards.size(1),
+            sequence_lengths_plus_one,
             sequence_lengths,
         )
-        rewards[[actual_start, actual_end]] += scores
+        rewards[[batch_indices, sequence_end_indices]] += scores
 
         # 5. whiten rewards
         if config.whiten_rewards:
             rewards = masked_whiten(
-                rewards, mask=~padding_mask_p1, shift_mean=False
+                rewards, mask=~padding_mask_plus_one, shift_mean=False
             )
-            rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
+            rewards = torch.masked_fill(rewards, padding_mask_plus_one, 0)
 
         # 6. compute advantages and returns
         # Initialise the GAE at 0 for the last time step.
-        lastgaelam = 0
+        last_gae = 0
         advantages_reversed = []
         gen_length = responses.shape[1]
         for t in reversed(range(gen_length)):
-            nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
+            nextvalues = state_values[:, t + 1] if t < gen_length - 1 else 0.0
             # Compute the TD-error
-            delta = rewards[:, t] + config.gamma * nextvalues - values[:, t]
+            delta = rewards[:, t] + config.gamma * nextvalues - state_values[:, t]
             # Use the GAE backwards recursion relationship
-            lastgaelam = delta + config.gamma * config.lam * lastgaelam
-            advantages_reversed.append(lastgaelam)
+            last_gae = delta + config.gamma * config.lam * last_gae
+            advantages_reversed.append(last_gae)
         # Create the advantage estimates by reversing the GAE backward recursion
-        advantages = torch.stack(advantages_reversed[::-1], axis=1)
+        advantages = torch.stack(advantages_reversed[::-1], dim=1)
         # Set the return estimates to be the advantage estimates
-        returns = advantages + values
+        returns = advantages + state_values
         # Whiten the advantages. Note that this is *non-optional* and *done at the entire batch level*
         advantages = masked_whiten(advantages, ~padding_mask)
         advantages = torch.masked_fill(advantages, padding_mask, 0)
@@ -408,9 +408,9 @@ def ppo_batch_update(
                 query_responses=query_responses,
                 logprobs=logprobs,
                 returns=returns,
-                values=values,
+                state_values=state_values,
                 padding_mask=padding_mask,
-                padding_mask_p1=padding_mask_p1,
+                padding_mask_plus_one=padding_mask_plus_one,
                 context_length=context_length,
                 pad_token_id=processing_class.pad_token_id,
                 batch_inds=batch_inds,
