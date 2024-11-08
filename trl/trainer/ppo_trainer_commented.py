@@ -134,8 +134,7 @@ class PPOTrainer(Trainer):
 
         assert processing_class is not None
 
-        self.args = config
-        args = config
+        self.config = config
         self.processing_class = processing_class
         self.policy = policy
 
@@ -162,76 +161,76 @@ class PPOTrainer(Trainer):
 
         # One "episode" is one prompt-completion pair
         if (
-            args.total_episodes is None
+            config.total_episodes is None
         ):  # allow the users to define episodes in terms of epochs.
-            args.total_episodes = int(args.num_train_epochs * self.train_dataset_len)
+            config.total_episodes = int(config.num_train_epochs * self.train_dataset_len)
         accelerator = Accelerator(
-            gradient_accumulation_steps=args.gradient_accumulation_steps
+            gradient_accumulation_steps=config.gradient_accumulation_steps
         )
         self.accelerator = accelerator
 
         # The number of processes we're using
-        args.world_size = accelerator.num_processes
+        config.world_size = accelerator.num_processes
         # per_device_train_batch_size
         # gradient_accumulation_steps
         # num_mini_batches
-        args.local_batch_size = (
-            args.per_device_train_batch_size
-            * args.gradient_accumulation_steps
-            * args.num_mini_batches
+        config.local_batch_size = (
+            config.per_device_train_batch_size
+            * config.gradient_accumulation_steps
+            * config.num_mini_batches
         )
         # Total batch size across all processes
-        args.micro_batch_size = int(args.per_device_train_batch_size * args.world_size)
-        args.batch_size = int(args.local_batch_size * args.world_size)
-        args.mini_batch_size = exact_div(
-            args.batch_size,
-            args.num_mini_batches,
+        config.micro_batch_size = int(config.per_device_train_batch_size * config.world_size)
+        config.batch_size = int(config.local_batch_size * config.world_size)
+        config.mini_batch_size = exact_div(
+            config.batch_size,
+            config.num_mini_batches,
             "`batch_size` must be a multiple of `num_mini_batches`",
         )
-        args.local_mini_batch_size = exact_div(
-            args.local_batch_size,
-            args.num_mini_batches,
+        config.local_mini_batch_size = exact_div(
+            config.local_batch_size,
+            config.num_mini_batches,
             "`local_batch_size` must be a multiple of `num_mini_batches`",
         )
-        if args.whiten_rewards:
+        if config.whiten_rewards:
             assert (
-                args.local_mini_batch_size >= 8
-            ), f"Per-rank minibatch size {args.local_mini_batch_size} is insufficient for whitening"
+                config.local_mini_batch_size >= 8
+            ), f"Per-rank minibatch size {config.local_mini_batch_size} is insufficient for whitening"
         # `per_rank_rollout_batch_size` is our `args.local_batch_size`
         # `per_rank_minibatch_size` is our `args.local_mini_batch_size`
-        args.num_total_batches = math.ceil(
-            args.total_episodes / args.batch_size
+        config.num_total_batches = math.ceil(
+            config.total_episodes / config.batch_size
         )  # we may train for more than `total_episodes`
         time_tensor = torch.tensor(int(time.time()), device=accelerator.device)
         time_int = broadcast(
             time_tensor, 0
         ).item()  # avoid different timestamps across processes
-        args.run_name = f"{args.exp_name}__{args.seed}__{time_int}"
-        self.local_seed = args.seed + accelerator.process_index * 100003  # Prime
-        if args.num_sample_generations > 0:
+        config.run_name = f"{config.exp_name}__{config.seed}__{time_int}"
+        self.local_seed = config.seed + accelerator.process_index * 100003  # Prime
+        if config.num_sample_generations > 0:
             self.sample_generations_freq = max(
-                1, args.num_total_batches // args.num_sample_generations
+                1, config.num_total_batches // config.num_sample_generations
             )
-        self.local_dataloader_batch_size = args.local_batch_size
+        self.local_dataloader_batch_size = config.local_batch_size
 
         #########base_model_uses_position_ids
         # setup model, optimizer, and others
         #########
         for module in [policy, ref_policy, value_model, reward_model]:
             disable_dropout_in_model(module)
-        if args.stop_token and args.stop_token == "eos":
-            args.stop_token_id = processing_class.eos_token_id
+        if config.stop_token and config.stop_token == "eos":
+            config.stop_token_id = processing_class.eos_token_id
         self.model = PolicyAndValueWrapper(policy, value_model)
         self.model.config = policy.config  # needed for pushing to hub
         self.create_optimizer_and_scheduler(
-            num_training_steps=args.num_total_batches
+            num_training_steps=config.num_total_batches
         )  # note that we are calling `self.lr_scheduler.step()` manually only at the batch level
 
         #########
         ### trainer specifics
         #########
         default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(
-            self.args.report_to
+            self.config.report_to
         )
         self.callbacks = (
             default_callbacks if callbacks is None else default_callbacks + callbacks
@@ -244,7 +243,7 @@ class PPOTrainer(Trainer):
             self.lr_scheduler,
         )
         self.add_callback(
-            PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK
+            PrinterCallback if self.config.disable_tqdm else DEFAULT_PROGRESS_CALLBACK
         )
         self.control = TrainerControl()
         self.state = OnlineTrainerState(
@@ -266,10 +265,10 @@ class PPOTrainer(Trainer):
         )
         # Create distant repo and output directory if needed
         self.hub_model_id = None
-        if self.args.push_to_hub:
+        if self.config.push_to_hub:
             self.init_hf_repo()
-        if self.args.should_save:
-            os.makedirs(self.args.output_dir, exist_ok=True)
+        if self.config.should_save:
+            os.makedirs(self.config.output_dir, exist_ok=True)
 
         # Add tags for models that have been loaded with the correct transformers version
         if hasattr(self.model, "add_model_tags"):
@@ -287,7 +286,7 @@ class PPOTrainer(Trainer):
         )
         # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
         # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
-        torch.manual_seed(args.seed)
+        torch.manual_seed(config.seed)
         self.model, self.optimizer, self.dataloader = accelerator.prepare(
             self.model, self.optimizer, self.dataloader
         )
@@ -295,7 +294,7 @@ class PPOTrainer(Trainer):
 
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
-            batch_size=args.per_device_eval_batch_size,
+            batch_size=config.per_device_eval_batch_size,
             collate_fn=DataCollatorWithPadding(self.processing_class),
             drop_last=True,
         )  # no need to shuffle eval dataset
@@ -304,12 +303,12 @@ class PPOTrainer(Trainer):
         if self.is_deepspeed_enabled:
             self.reward_model = prepare_deepspeed(
                 self.reward_model,
-                args.per_device_train_batch_size,
-                args.fp16,
-                args.bf16,
+                config.per_device_train_batch_size,
+                config.fp16,
+                config.bf16,
             )
             self.ref_policy = prepare_deepspeed(
-                self.ref_policy, args.per_device_train_batch_size, args.fp16, args.bf16
+                self.ref_policy, config.per_device_train_batch_size, config.fp16, config.bf16
             )
         else:
             self.ref_policy = self.ref_policy.to(self.accelerator.device)
@@ -339,7 +338,7 @@ class PPOTrainer(Trainer):
             self.deepspeed = backup_deepspeed
 
     def train(self):
-        args = self.args
+        args = self.config
         accelerator = self.accelerator
         optimizer = self.optimizer
         model = self.model
@@ -564,8 +563,8 @@ class PPOTrainer(Trainer):
                     postprocessed_responses == self.processing_class.eos_token_id,
                     dim=-1,
                 )
-                if self.args.missing_eos_penalty is not None:
-                    scores[~contain_eos_token] -= self.args.missing_eos_penalty
+                if self.config.missing_eos_penalty is not None:
+                    scores[~contain_eos_token] -= self.config.missing_eos_penalty
                 # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
@@ -864,7 +863,7 @@ class PPOTrainer(Trainer):
             if self.control.should_save:
                 self._save_checkpoint(model, trial=None, metrics=metrics)
                 self.control = self.callback_handler.on_save(
-                    self.args, self.state, self.control
+                    self.config, self.state, self.control
                 )
             del (
                 kl,
@@ -912,15 +911,15 @@ class PPOTrainer(Trainer):
         if self.control.should_save:
             self._save_checkpoint(model, trial=None, metrics=None)
             self.control = self.callback_handler.on_save(
-                self.args, self.state, self.control
+                self.config, self.state, self.control
             )
 
     def generate_completions(self, sampling: bool = False):
-        args = self.args
+        args = self.config
         processing_class = self.processing_class
         reward_model_processing_class = self.reward_model_processing_class
         generation_config = GenerationConfig(
-            max_new_tokens=self.args.response_length,
+            max_new_tokens=self.config.response_length,
             temperature=(0.01 + 1e-7),
             top_k=0.0,
             top_p=1.0,
@@ -1055,4 +1054,4 @@ class PPOTrainer(Trainer):
             paper_id="1909.08593",
         )
 
-        model_card.save(os.path.join(self.args.output_dir, "README.md"))
+        model_card.save(os.path.join(self.config.output_dir, "README.md"))
