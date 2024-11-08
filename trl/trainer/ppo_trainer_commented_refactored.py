@@ -135,12 +135,8 @@ def ppo_micro_batch_updates(
     ):
         # I think that micro-batches are minibatches divided between machines.
         with accelerator.accumulate(model):
-            micro_batch_end = (
-                micro_batch_start + config.per_device_train_batch_size
-            )
-            micro_batch_inds = mini_batch_inds[
-                micro_batch_start:micro_batch_end
-            ]
+            micro_batch_end = micro_batch_start + config.per_device_train_batch_size
+            micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
             # Retrieve the relevant variables for this microbatch
             micro_batch_advantage = advantages[micro_batch_inds]
             micro_batch_responses = responses[micro_batch_inds]
@@ -399,10 +395,15 @@ def ppo_batch_update(
             0, config.local_batch_size, config.local_mini_batch_size
         )):
             ppo_micro_batch_updates(
+                # config!
                 config=config,
+                # integers
                 ppo_epoch_idx=ppo_epoch_idx,
                 minibatch_idx=minibatch_idx,
                 mini_batch_start=mini_batch_start,
+                context_length=context_length,
+                pad_token_id=processing_class.pad_token_id,
+                # tensors
                 advantages=advantages,
                 responses=responses,
                 query_responses=query_responses,
@@ -411,8 +412,6 @@ def ppo_batch_update(
                 state_values=state_values,
                 padding_mask=padding_mask,
                 padding_mask_plus_one=padding_mask_plus_one,
-                context_length=context_length,
-                pad_token_id=processing_class.pad_token_id,
                 batch_inds=batch_inds,
                 # Stateful parameters that get updated
                 model=model,
