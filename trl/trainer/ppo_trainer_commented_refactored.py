@@ -56,17 +56,17 @@ from ..trainer.utils import (
     batch_generation,
     disable_dropout_in_model,
     exact_div,
-    first_true_indices,
     forward,
     retokenize,
-    get_just_value,
-    get_just_reward,
     prepare_deepspeed,
     print_rich_table,
     truncate_response,
 )
 from .ppo_config import PPOConfig
 from .utils import generate_model_card
+from .on_policy_utils import get_just_reward, forward_rollout
+
+
 
 if is_wandb_available():
     import wandb
@@ -115,161 +115,6 @@ class PPOStats:
         self.value_function_clipfrac_stats[update_location] = value_function_clipfrac
         self.entropy_stats[update_location] = entropy_mean
         self.ratio_stats[update_location] = ratio_mean
-
-
-def calc_logprob(idx: int, response: torch.Tensor, logitss: torch.Tensor, local_rollout_forward_batch_size: int):
-    # Get the logits for all tokens at each step of the generation.
-    logits = logitss[idx : idx + local_rollout_forward_batch_size]
-
-    # Get the log probabilities of every token at each step of the generation
-    all_logprob = F.log_softmax(logits, dim=-1)
-
-    # Get only those log-probabilities for the tokens that were actually generated.
-    logprob = torch.gather(
-        all_logprob, 2, response.unsqueeze(-1)
-    ).squeeze(-1)
-
-    return logprob
-
-
-def calc_ref_logprob(ref_policy, query_response, response, pad_token_id: int, context_length: int, temperature: float):
-    # This computes the log-probabilities for the base model (reference model)
-    ref_output = forward(
-        ref_policy, query_response, pad_token_id
-    )
-    ref_logits = ref_output.logits[:, context_length - 1 : -1]
-    ref_logits /= temperature + 1e-7
-    ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
-
-    # Get only those log-probabilities for the tokens that were actually generated.
-    ref_logprob = torch.gather(
-        ref_all_logprob, 2, response.unsqueeze(-1)
-    ).squeeze(-1)
-
-    return ref_logprob
-
-
-def forward_rollout(
-    queries,
-    query_responses,
-    logitss,
-    ref_policy,
-    unwrapped_value_model,
-    reward_model,
-    processing_class,
-    reward_model_processing_class,
-    context_length,
-    pad_token_id,
-    stop_token_id,
-    local_rollout_forward_batch_size,
-    temperature,
-    device,
-):
-    responses = []
-    postprocessed_responses = []
-    logprobs = []
-    ref_logprobs = []
-    scores = []
-    sequence_lengths = []
-    values = []
-
-    # Note: local_rollout_forward_batch_size gives how many token generation steps we chunk trajectories into.
-    # Iterate through chunks of the queries, moving along by the local_rollout_forward_batch_size each time.
-    for i in range(
-        0, queries.shape[0], local_rollout_forward_batch_size
-    ):
-        # Extract the query
-        query = queries[i : i + local_rollout_forward_batch_size]
-        # Extract the corresponding response
-        query_response = query_responses[
-            i : i + local_rollout_forward_batch_size
-        ]
-        # Discard the first context_length tokens.
-        response = query_response[:, context_length:]
-
-        logprob = calc_logprob(i, response, logitss, local_rollout_forward_batch_size)
-        torch.cuda.empty_cache()
-
-        ref_logprob = calc_ref_logprob(
-            ref_policy, query_response, response, pad_token_id, context_length, temperature
-        )
-        torch.cuda.empty_cache()
-
-        # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
-        postprocessed_response = response
-        if (
-            stop_token_id is not None
-        ):  # handle the edge case when stop_token_id exists but is 0
-            postprocessed_response = truncate_response(
-                stop_token_id, pad_token_id, response
-            )
-
-        # Response Processing 2. run reward model on the truncated responses
-
-        # FLAG - This feels inefficient for when the action-value function is a head on the model doing the generation
-        # Maybe there's a way to get around this. For now, we might just want separate models.
-        postprocessed_query_response = torch.cat(
-            (query, postprocessed_response), 1
-        )
-        sequence_length = (
-            first_true_indices(
-                postprocessed_response == pad_token_id
-            )
-            - 1
-        )
-        # It looks like TRL treates rewards and values the same way.
-        # We might need our own class for action-value functions.
-        # full_value has shape [batch, query_length, 1]
-
-        full_value = get_just_value(
-            unwrapped_value_model,
-            query_response,
-            pad_token_id,
-        )
-        # Extract only the value estimates for the completion
-        value = full_value[:, context_length - 1 : -1].squeeze(-1)
-        # The score is the reward at the end of each query sequence.
-        # score has shape [batch]
-        reward_model_inputs, reward_model_pad_token = retokenize(
-            postprocessed_query_response,
-            device,
-            processing_class,
-            reward_model_processing_class,
-        )
-        score = get_just_reward(
-            reward_model,
-            reward_model_inputs,
-            reward_model_pad_token,
-            context_length,
-        )
-
-        # This is just a bunch of logging stuff
-        responses.append(response)
-        postprocessed_responses.append(postprocessed_response)
-        logprobs.append(logprob)
-        ref_logprobs.append(ref_logprob)
-        sequence_lengths.append(sequence_length)
-        scores.append(score)
-        values.append(value)
-
-    # Now we stack all these sub-chunks together so we can pass them through as one batch.
-    responses = torch.cat(responses, 0)
-    postprocessed_responses = torch.cat(postprocessed_responses, 0)
-    logprobs = torch.cat(logprobs, 0)
-    ref_logprobs = torch.cat(ref_logprobs, 0)
-    sequence_lengths = torch.cat(sequence_lengths, 0)
-    scores = torch.cat(scores, 0)
-    values = torch.cat(values, 0)
-
-    return (
-        responses,
-        postprocessed_responses,
-        logprobs,
-        ref_logprobs,
-        sequence_lengths,
-        scores,
-        values,
-    )
 
 
 def ppo_micro_batch_updates(

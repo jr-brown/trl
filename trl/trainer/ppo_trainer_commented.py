@@ -59,14 +59,13 @@ from ..trainer.utils import (
     first_true_indices,
     forward,
     retokenize,
-    get_just_value,
-    get_just_reward,
     prepare_deepspeed,
     print_rich_table,
     truncate_response,
 )
 from .ppo_config import PPOConfig
 from .utils import generate_model_card
+from .on_policy_utils import get_just_value, get_just_reward
 
 if is_wandb_available():
     import wandb
