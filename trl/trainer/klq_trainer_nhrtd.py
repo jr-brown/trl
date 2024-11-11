@@ -676,7 +676,7 @@ class KLQTrainer(OnPolicyTrainer):
             model=self.model,
             ref_policy=self.ref_policy,
             reward_model=self.reward_model,
-            ppo_stats=self.stats,
+            klq_stats=self.stats,
             # data for this batch!
             data=data,
         )
