@@ -18,13 +18,14 @@ import os
 import textwrap
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor  # for type hinting
 from accelerate import Accelerator
 from accelerate.utils import broadcast, gather_object
 from datasets import Dataset
@@ -59,80 +60,253 @@ from ..trainer.utils import (
     print_rich_table,
     truncate_response,
 )
-from .on_policy_trainer import OnPolicyTrainer
-from .ppo_config import PPOConfig
+from .klq_config import KLQConfig
 from .utils import generate_model_card
 from .on_policy_utils import get_just_reward, forward_rollout
-
+from .on_policy_trainer import OnPolicyTrainer
 
 if is_wandb_available():
     import wandb
 
 
-# To actually make type checking helpful and not throw errors everywhere
 ProcessingClass = PreTrainedTokenizerBase
 
 
 INVALID_LOGPROB = 1.0
 
 
-class PPOStats:
-    def __init__(self, stats_shape: Tuple[int, int, int], device: torch.device):
-        self.approximate_kl_stats = torch.zeros(stats_shape, device=device)
-        self.policy_gradient_clipfrac_stats = torch.zeros(stats_shape, device=device)
-        self.policy_gradient_loss_stats = torch.zeros(stats_shape, device=device)
-        self.value_function_loss_stats = torch.zeros(stats_shape, device=device)
-        self.value_function_clipfrac_stats = torch.zeros(stats_shape, device=device)
+def l2_loss(
+    config,
+    action_value_prediction,
+    state_value_prediction,
+    new_ref_log_ratio,
+    micro_batch_prev_state_values,
+    prev_ref_log_ratio,
+    micro_batch_return,
+):
+    return torch.square(action_value_prediction - micro_batch_return)
+
+
+def huber_loss(
+    config,
+    action_value_prediction,
+    state_value_prediction,
+    new_ref_log_ratio,
+    micro_batch_prev_state_values,
+    prev_ref_log_ratio,
+    micro_batch_return,
+):
+    huber_cutoff = config.loss_kwargs["huber_cutoff"]
+    return F.huber_loss(
+        action_value_prediction,
+        micro_batch_return,
+        reduction="none",
+        delta=huber_cutoff,
+    )
+
+
+def value_clipped_loss(
+    config,
+    action_value_prediction,
+    state_value_prediction,
+    new_ref_log_ratio,
+    micro_batch_prev_state_values,
+    prev_ref_log_ratio,
+    micro_batch_return,
+):
+    # Unload arguments
+    kl_coef = config.kl_coef
+    action_value_clip_bound = config.loss_kwargs["action_value_clip_bound"]
+
+    # Compute the standard l2 loss
+    unclipped_value_loss = torch.square(action_value_prediction - micro_batch_return)
+
+    # Compute the clipped loss
+    prev_action_value_prediction = (
+        kl_coef * (prev_ref_log_ratio) + micro_batch_prev_state_values
+    )
+    clipped_aciton_value_prediction = torch.clamp(
+        action_value_prediction,
+        prev_action_value_prediction - action_value_clip_bound,
+        prev_action_value_prediction + action_value_clip_bound,
+    )
+    clipped_value_loss = torch.square(
+        clipped_aciton_value_prediction - micro_batch_return
+    )
+
+    # Return the maximum of the two losses
+    return torch.max(unclipped_value_loss, clipped_value_loss)
+
+
+def ratio_clipped_loss(
+    config,
+    action_value_prediction,
+    state_value_prediction,
+    new_ref_log_ratio,
+    micro_batch_prev_state_values,
+    prev_ref_log_ratio,
+    micro_batch_return,
+):
+    # Unload arguments
+    kl_coef = config.kl_coef
+    log_ratio_clip_bound = config.loss_kwargs["log_ratio_clip_bound"]
+
+    # Compute the standard l2 loss
+    unclipped_value_loss = torch.square(action_value_prediction - micro_batch_return)
+
+    # Compute the clipped loss
+    clipped_log_ratio = torch.clamp(
+        new_ref_log_ratio,
+        prev_ref_log_ratio - log_ratio_clip_bound,
+        prev_ref_log_ratio + log_ratio_clip_bound,
+    )
+    clipped_action_value_prediction = (
+        kl_coef * (clipped_log_ratio) + state_value_prediction
+    )
+    clipped_value_loss = torch.square(
+        clipped_action_value_prediction - micro_batch_return
+    )
+
+    # Return the maximum of the two losses
+    return torch.max(unclipped_value_loss, clipped_value_loss)
+
+
+def double_clipped_loss(
+    config,
+    action_value_prediction,
+    state_value_prediction,
+    new_ref_log_ratio,
+    micro_batch_prev_state_values,
+    prev_ref_log_ratio,
+    micro_batch_return,
+):
+    # unload arguments
+    kl_coef = config.kl_coef
+    action_value_clip_bound = config.loss_kwargs["action_value_clip_bound"]
+    log_ratio_clip_bound = config.loss_kwargs["log_ratio_clip_bound"]
+
+    # Compute the standard l2 loss
+    unclipped_value_loss = torch.square(action_value_prediction - micro_batch_return)
+
+    # Compute the action-value clipped loss
+    prev_action_value_prediction = (
+        kl_coef * (prev_ref_log_ratio) + micro_batch_prev_state_values
+    )
+    action_value_clipped_aciton_value_prediction = torch.clamp(
+        action_value_prediction,
+        prev_action_value_prediction - action_value_clip_bound,
+        prev_action_value_prediction + action_value_clip_bound,
+    )
+    action_value_clipped_value_loss = torch.square(
+        action_value_clipped_aciton_value_prediction - micro_batch_return
+    )
+
+    # Compute the log-ratio clipped loss
+    clipped_log_ratio = torch.clamp(
+        new_ref_log_ratio,
+        prev_ref_log_ratio - log_ratio_clip_bound,
+        prev_ref_log_ratio + log_ratio_clip_bound,
+    )
+    log_ratio_clipped_action_value_prediction = (
+        kl_coef * (clipped_log_ratio) + state_value_prediction
+    )
+    log_ratio_clipped_value_loss = torch.square(
+        log_ratio_clipped_action_value_prediction - micro_batch_return
+    )
+
+    # Return the maximum of the three losses
+    return torch.max(
+        torch.max(unclipped_value_loss, action_value_clipped_value_loss),
+        log_ratio_clipped_value_loss,
+    )
+
+
+# This type checking is fucked.
+loss_function_map: dict[
+    str,
+    Callable[
+        [
+            KLQConfig,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ],
+        torch.Tensor,
+    ],
+] = {
+    "l2_loss": l2_loss,
+    "huber": huber_loss,
+    "value_clipped": value_clipped_loss,
+    "ratio_clipped": ratio_clipped_loss,
+    "double_clipped": double_clipped_loss,
+}
+
+
+class KLQStats:
+    def __init__(self, stats_shape: Tuple[int, int, int], device: torch.device) -> None:
+        self.loss_function_stats = torch.zeros(stats_shape, device=device)
+        self.action_value_stats = torch.zeros(stats_shape, device=device)
+        self.state_value_stats = torch.zeros(stats_shape, device=device)
+        self.log_ratio_new_ref_stats = torch.zeros(stats_shape, device=device)
         self.entropy_stats = torch.zeros(stats_shape, device=device)
-        self.ratio_stats = torch.zeros(stats_shape, device=device)
+        self.kl_prev_ref_stats = torch.zeros(stats_shape, device=device)
+        self.kl_new_ref_stats = torch.zeros(stats_shape, device=device)
+        self.kl_prev_new_stats = torch.zeros(stats_shape, device=device)
+        self.kl_new_prev_stats = torch.zeros(stats_shape, device=device)
 
     def update(
         self,
         update_location: Tuple[int, int, int],
-        approximate_kl_mean: torch.Tensor,
-        policy_gradient_clipfrac: torch.Tensor,
-        policy_gradient_loss: torch.Tensor,
-        state_value_function_loss: torch.Tensor,
-        state_value_function_clipfrac: torch.Tensor,
-        entropy_mean: torch.Tensor,
-        ratio_mean: torch.Tensor,
+        action_value_function_loss,
+        action_value_prediction,
+        state_value_prediction,
+        new_ref_log_ratio,
+        entropy,
+        kl_prev_ref,
+        kl_new_ref,
+        kl_prev_new,
+        kl_new_prev,
     ):
-        self.approximate_kl_stats[update_location] = approximate_kl_mean
-        self.policy_gradient_clipfrac_stats[update_location] = policy_gradient_clipfrac
-        self.policy_gradient_loss_stats[update_location] = policy_gradient_loss
-        self.value_function_loss_stats[update_location] = state_value_function_loss
-        self.value_function_clipfrac_stats[update_location] = (
-            state_value_function_clipfrac
-        )
-        self.entropy_stats[update_location] = entropy_mean
-        self.ratio_stats[update_location] = ratio_mean
+        self.loss_function_stats[update_location] = action_value_function_loss
+        self.action_value_stats[update_location] = action_value_prediction
+        self.state_value_stats[update_location] = state_value_prediction
+        self.log_ratio_new_ref_stats[update_location] = new_ref_log_ratio
+        self.entropy_stats[update_location] = entropy
+        self.kl_prev_ref_stats[update_location] = kl_prev_ref
+        self.kl_new_ref_stats[update_location] = kl_new_ref
+        self.kl_prev_new_stats[update_location] = kl_prev_new
+        self.kl_new_prev_stats[update_location] = kl_new_prev
 
 
-def ppo_micro_batch_updates(
-    config: PPOConfig,
-    epoch_idx,
-    minibatch_idx,
+def micro_batch_updates(
+    config: KLQConfig,
+    # integers
+    epoch_idx: int,
+    minibatch_idx: int,
     mini_batch_start: int,
-    model,
-    advantages,
+    context_length: int,
+    pad_token_id: int,
+    # tensors
+    batch_inds,
     responses,
     query_responses,
     logprobs,
+    ref_logprobs,
     returns,
     state_values,
     padding_mask,
     padding_mask_plus_one,
-    context_length: int,
-    pad_token_id: int,
-    batch_inds: np.ndarray,
-    accelerator: Accelerator,
+    # Stateful parameters that get updated
+    model,
+    accelerator,
     optimizer,
-    stats: PPOStats,
+    stats,
 ):
     mini_batch_end = mini_batch_start + config.local_mini_batch_size
     mini_batch_inds = batch_inds[mini_batch_start:mini_batch_end]
     gradient_accumulation_idx = 0
-
     for micro_batch_start in range(
         0, config.local_mini_batch_size, config.per_device_train_batch_size
     ):
@@ -141,17 +315,15 @@ def ppo_micro_batch_updates(
             micro_batch_end = micro_batch_start + config.per_device_train_batch_size
             micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
             # Retrieve the relevant variables for this microbatch
-            micro_batch_advantage = advantages[micro_batch_inds]
             micro_batch_responses = responses[micro_batch_inds]
             micro_batch_query_responses = query_responses[micro_batch_inds]
-            micro_batch_logprobs = logprobs[micro_batch_inds]
+            micro_batch_prev_logprobs = logprobs[micro_batch_inds]
+            micro_batch_ref_logprobs = ref_logprobs[micro_batch_inds]
             micro_batch_return = returns[micro_batch_inds]
-            micro_batch_state_values = state_values[micro_batch_inds]
+            micro_batch_prev_state_values = state_values[micro_batch_inds]
 
-            output, state_value_prediction_temp = forward(
-                model,
-                micro_batch_query_responses,
-                pad_token_id,
+            output, state_value_prediction_temporary = forward(
+                model, micro_batch_query_responses, pad_token_id
             )
             logits = output.logits[:, context_length - 1 : -1]
             logits /= config.temperature + 1e-7
@@ -160,82 +332,52 @@ def ppo_micro_batch_updates(
                 new_all_logprobs, 2, micro_batch_responses.unsqueeze(-1)
             ).squeeze(-1)
             new_logprobs = torch.masked_fill(
-                new_logprobs,
-                padding_mask[micro_batch_inds],
-                INVALID_LOGPROB,
+                new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
             )
 
-            # Compute the value loss term
-            state_value_prediction = state_value_prediction_temp[
+            # Compute inputs to loss function
+            state_value_prediction = state_value_prediction_temporary[
                 :, context_length - 1 : -1
             ].squeeze(-1)
             state_value_prediction = torch.masked_fill(
                 state_value_prediction, padding_mask_plus_one[micro_batch_inds], 0
             )
-            state_value_prediction_clipped = torch.clamp(
-                state_value_prediction,
-                micro_batch_state_values - config.cliprange_value,
-                micro_batch_state_values + config.cliprange_value,
-            )
-            state_value_function_losses_unclipped = torch.square(
-                state_value_prediction - micro_batch_return
-            )
-            state_value_function_losses_clipped = torch.square(
-                state_value_prediction_clipped - micro_batch_return
-            )
-            state_value_function_loss_max = torch.max(
-                state_value_function_losses_unclipped,
-                state_value_function_losses_clipped,
-            )
-            state_value_function_loss = 0.5 * masked_mean(
-                state_value_function_loss_max,
-                ~padding_mask_plus_one[micro_batch_inds],
-            )
-            state_value_function_clipfrac = masked_mean(
-                (
-                    state_value_function_losses_clipped
-                    > state_value_function_losses_unclipped
-                ).float(),
-                ~padding_mask_plus_one[micro_batch_inds],
+            new_ref_log_ratio = new_logprobs - micro_batch_ref_logprobs
+            prev_ref_log_ratio = micro_batch_prev_logprobs - micro_batch_ref_logprobs
+            action_value_prediction = (
+                config.kl_coef * (new_ref_log_ratio) + state_value_prediction
             )
 
-            # Compute the policy gradient loss term.
-            logprobs_diff = new_logprobs - micro_batch_logprobs
-            ratio = torch.exp(logprobs_diff)
-            policy_gradient_losses_unclipped = -micro_batch_advantage * ratio
-            policy_gradient_losses_clipped = -micro_batch_advantage * torch.clamp(
-                ratio, 1.0 - config.cliprange, 1.0 + config.cliprange
+            # Compute loss
+            action_value_function_losses = loss_function_map[config.loss_function](
+                config,
+                action_value_prediction,
+                state_value_prediction,
+                new_ref_log_ratio,
+                micro_batch_prev_state_values,
+                prev_ref_log_ratio,
+                micro_batch_return,
             )
-            policy_gradient_losses_max = torch.max(
-                policy_gradient_losses_unclipped,
-                policy_gradient_losses_clipped,
+            action_value_function_loss = masked_mean(
+                action_value_function_losses, ~padding_mask_plus_one[micro_batch_inds]
             )
-            policy_gradient_loss = masked_mean(
-                policy_gradient_losses_max,
-                ~padding_mask[micro_batch_inds],
-            )
-            loss = policy_gradient_loss + config.vf_coef * state_value_function_loss
 
             # Perform the update step.
-            accelerator.backward(loss)
+            accelerator.backward(action_value_function_loss)
             optimizer.step()
             optimizer.zero_grad()
 
             # This is all just for logging.
             with torch.no_grad():
-                policy_gradient_clipfrac = masked_mean(
-                    (
-                        policy_gradient_losses_clipped
-                        > policy_gradient_losses_unclipped
-                    ).float(),
-                    ~padding_mask[micro_batch_inds],
-                )
                 prob_dist = torch.nn.functional.softmax(logits, dim=-1)
                 entropy = torch.logsumexp(logits, dim=-1) - torch.sum(
                     prob_dist * logits, dim=-1
                 )
-                approximate_kl = 0.5 * (logprobs_diff**2).mean()
-                # create a slice object for the indices that we want to populate
+                prev_new_log_ratio = micro_batch_prev_logprobs - new_logprobs
+                prev_ref_log_ratio = micro_batch_prev_logprobs - ref_logprobs
+                new_prev_log_ratio = -prev_new_log_ratio
+                new_prev_ratio = torch.exp(new_prev_log_ratio)
+
                 update_location = (
                     epoch_idx,
                     minibatch_idx,
@@ -243,39 +385,48 @@ def ppo_micro_batch_updates(
                 )
                 stats.update(
                     update_location,
-                    approximate_kl,
-                    policy_gradient_clipfrac,
-                    policy_gradient_loss,
-                    state_value_function_loss,
-                    state_value_function_clipfrac,
-                    entropy.mean(),
-                    ratio.mean(),
+                    action_value_function_loss=action_value_function_loss.mean(),
+                    action_value_prediction=action_value_prediction.mean(),
+                    state_value_prediction=state_value_prediction.mean(),
+                    new_ref_log_ratio=new_ref_log_ratio.mean(),
+                    entropy=entropy.mean(),
+                    kl_prev_ref=prev_ref_log_ratio.mean(),
+                    kl_new_ref=(new_prev_ratio * new_ref_log_ratio).mean(),
+                    kl_prev_new=prev_new_log_ratio.mean(),
+                    kl_new_prev=(new_prev_ratio * new_prev_log_ratio).mean(),
                 )
         gradient_accumulation_idx += 1
+    minibatch_idx += 1
 
 
-def ppo_batch_update(
-    config,
+def klq_batch_update(
+    config: KLQConfig,
     generation_config,
     processing_class,
     reward_model_processing_class,
-    # GPU related things
-    device: torch.device,
-    accelerator,
+    # optimisation / performance
     optimizer,
-    # stateful parameters
+    accelerator,
+    device: torch.device,
+    # stateful parameters to be updated
     model,
     ref_policy,
     reward_model,
-    ppo_stats,
-    # data for this batch
-    data,
+    klq_stats: KLQStats,
+    # data for the this batch!
+    data: Dict[str, Tensor],
 ):
-    # Generate a PPO dataset for this update phase
     with torch.no_grad():
         queries = data["input_ids"].to(device)
         context_length = queries.shape[1]
-
+        responses = []
+        postprocessed_responses = []
+        logprobs = []
+        ref_logprobs = []
+        scores = []
+        sequence_lengths = []
+        state_values = []
+        action_values = []
         with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
             # query_respones and logitss are both torch Tensors.
             # query_responses has shape [batch, query_length]
@@ -287,7 +438,6 @@ def ppo_batch_update(
                 processing_class.pad_token_id,
                 generation_config,
             )
-
         (
             responses,
             postprocessed_responses,
@@ -312,20 +462,20 @@ def ppo_batch_update(
             temperature=config.temperature,
             device=device,
         )
+        action_values = config.kl_coef * (logprobs - ref_logprobs) + state_values
         torch.cuda.empty_cache()
         gc.collect()
 
         # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
         # Completions not passing that filter will receive a lower score.
         contain_eos_token = torch.any(
-            postprocessed_responses == processing_class.eos_token_id,
-            dim=-1,
+            postprocessed_responses == processing_class.eos_token_id, dim=-1
         )
         if config.missing_eos_penalty is not None:
             scores[~contain_eos_token] -= config.missing_eos_penalty
         # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
-        # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
+        # be very careful with `padding_mask_plus_one`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
         response_idxs = torch.arange(
             responses.shape[1], device=responses.device
         ).repeat(responses.shape[0], 1)
@@ -335,13 +485,14 @@ def ppo_batch_update(
         sequence_lengths_plus_one = sequence_lengths + 1
         padding_mask_plus_one = response_idxs > (sequence_lengths_plus_one.unsqueeze(1))
         state_values = torch.masked_fill(state_values, padding_mask_plus_one, 0)
+        action_values = torch.masked_fill(action_values, padding_mask_plus_one, 0)
 
         # 4. compute rewards
-        kl = logprobs - ref_logprobs
-        non_score_reward = -config.kl_coef * kl
         # rewards has shape [batch, response_length]
-        rewards = non_score_reward.clone()
-        batch_indices = torch.arange(rewards.size(0), device=rewards.device)
+        rewards = torch.zeros_like(logprobs)
+        batch_indices = torch.arange(
+            rewards.size(0), device=rewards.device
+        )  # [0, 1, 2, ..., batch_size - 1]
         sequence_end_indices = torch.where(
             sequence_lengths_plus_one < rewards.size(1),
             sequence_lengths_plus_one,
@@ -360,11 +511,14 @@ def ppo_batch_update(
         # Initialise the GAE at 0 for the last time step.
         last_gae = 0
         advantages_reversed = []
-        gen_length = responses.shape[1]
+        gen_length = responses.shape[1]  # This is the length of the responses.
         for t in reversed(range(gen_length)):
-            nextvalues = state_values[:, t + 1] if t < gen_length - 1 else 0.0
+            # Extract the next token state-values
+            next_state_values = state_values[:, t + 1] if t < gen_length - 1 else 0.0
             # Compute the TD-error
-            delta = rewards[:, t] + config.gamma * nextvalues - state_values[:, t]
+            delta = (
+                rewards[:, t] + config.gamma * next_state_values - action_values[:, t]
+            )
             # Use the GAE backwards recursion relationship
             last_gae = delta + config.gamma * config.lam * last_gae
             advantages_reversed.append(last_gae)
@@ -372,22 +526,33 @@ def ppo_batch_update(
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         # Set the return estimates to be the advantage estimates
         returns = advantages + state_values
+        returns = torch.masked_fill(returns, padding_mask_plus_one, 0)  # BUGHOTSPOT
+
         # Whiten the advantages. Note that this is *non-optional* and *done at the entire batch level*
-        advantages = masked_whiten(advantages, ~padding_mask)
-        advantages = torch.masked_fill(advantages, padding_mask, 0)
+        # advantages = masked_whiten(advantages, ~padding_mask)
+        # advantages = torch.masked_fill(advantages, padding_mask, 0)
+
+        # We only want the returns, so delete all other variables.
+        del (
+            rewards,
+            last_gae,
+            advantages_reversed,
+            delta,
+            next_state_values,
+            advantages,
+        )
         torch.cuda.empty_cache()
 
-    # Do multiple epochs of PPO training, using the dataset for this update phase
-    # use a fresh random shuffle in each epoch
+    # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
     # num_epochs_per_batch_update specifies how many times to loop over the PPO dataset.
     for epoch_idx in range(config.num_epochs_per_batch_update):
         # Draw a random permutation
         batch_inds = np.random.permutation(config.local_batch_size)
-        for minibatch_idx, mini_batch_start in enumerate(
-            range(0, config.local_batch_size, config.local_mini_batch_size)
+        minibatch_idx = 0
+        for mini_batch_start in range(
+            0, config.local_batch_size, config.local_mini_batch_size
         ):
-            ppo_micro_batch_updates(
-                # config!
+            micro_batch_updates(
                 config=config,
                 # integers
                 epoch_idx=epoch_idx,
@@ -397,10 +562,10 @@ def ppo_batch_update(
                 pad_token_id=processing_class.pad_token_id,
                 # tensors
                 batch_inds=batch_inds,
-                advantages=advantages,
                 responses=responses,
                 query_responses=query_responses,
                 logprobs=logprobs,
+                ref_logprobs=ref_logprobs,
                 returns=returns,
                 state_values=state_values,
                 padding_mask=padding_mask,
@@ -409,52 +574,46 @@ def ppo_batch_update(
                 model=model,
                 accelerator=accelerator,
                 optimizer=optimizer,
-                stats=ppo_stats,
+                stats=klq_stats,
             )
             torch.cuda.empty_cache()
 
-    # At the end of the update phase, log a bunch of statistics in the metrics dictionary.
+    # At the end of training, log a bunch of statistics in the metrics dictionary.
     with torch.no_grad():
-        mean_kl = kl.sum(1).mean()
         mean_entropy = (-logprobs).sum(1).mean()
-        mean_non_score_reward = non_score_reward.sum(1).mean()
-        rlhf_reward = mean_non_score_reward + scores.mean()
-        metrics = {}
 
-        # Refactor the metric caching to make it easier to parse
-        s = ppo_stats
+        metrics = {}
+        s = klq_stats
         metrics_gathered_and_meaned = {
-            "objective/kl": mean_kl,
-            "objective/entropy": mean_entropy,
-            "objective/non_score_reward": mean_non_score_reward,
-            "objective/rlhf_reward": rlhf_reward,
             "objective/scores": scores.mean(),
-            "policy/approximate_kl_avg": s.approximate_kl_stats,
-            "policy/clipfrac_avg": s.policy_gradient_clipfrac_stats,
-            "loss/policy_avg": s.policy_gradient_loss_stats,
-            "loss/value_avg": s.value_function_loss_stats,
-            "val/clipfrac_avg": s.value_function_clipfrac_stats,
-            "policy/entropy_avg": s.entropy_stats,
-            "val/ratio": s.ratio_stats,
+            "objective/kl_prev_ref": s.kl_prev_ref_stats,
+            "loss/avg_value_loss": s.loss_function_stats,
+            "value_function/avg_state_value": s.state_value_stats,
+            "value_function/avg_action_value": s.action_value_stats,
+            "value_function/avg_log_ratio": s.log_ratio_new_ref_stats,
+            "policy/entropy": s.entropy_stats,
+            "policy/kl_new_prev": s.kl_new_prev_stats,
+            "policy/kl_prev_new": s.kl_prev_new_stats,
+            "policy/kl_new_ref": s.kl_new_ref_stats,
         }
         for m_name, m_tensor in metrics_gathered_and_meaned.items():
             metrics[m_name] = accelerator.gather(m_tensor).mean().item()
 
-        metrics["val/ratio_var"] = accelerator.gather(s.ratio_stats).var().item()
-        metrics["val/num_eos_tokens"] = (
+        # Metrics that do not need gathering
+        metrics["objective/num_eos_tokens"] = (
             (responses == processing_class.eos_token_id).sum().item()
         )
+        metrics["loss/avg_target_values"] = returns.mean().item()
+        metrics["loss/var_target_values"] = returns.var().item()
 
-    return model, metrics
 
-
-class PPOTrainer(OnPolicyTrainer):
-    _tag_names = ["trl", "ppo"]
+class KLQTrainer(OnPolicyTrainer):
+    _tag_names = ["trl", "klq"]
 
     def __init__(
         self,
         # config and tokenizers
-        config: PPOConfig,
+        config: KLQConfig,
         processing_class: ProcessingClass,
         reward_model_processing_class: ProcessingClass,
         # models
@@ -489,19 +648,19 @@ class PPOTrainer(OnPolicyTrainer):
             callbacks=callbacks,
         )
 
-    def _initialise_stats(self) -> PPOStats:
+    def _initialise_stats(self) -> KLQStats:
         stats_shape = (
             self.args.num_epochs_per_batch_update,
             self.args.local_batch_size,
             self.args.local_mini_batch_size,
         )
-        return PPOStats(stats_shape, self.device)
+        return KLQStats(stats_shape, self.device)
 
     def _batch_update(
         self,
         data: Dict[str, torch.Tensor],
     ) -> Tuple[torch.nn.Module, Dict[str, float]]:
-        return ppo_batch_update(
+        return klq_batch_update(
             # config-like and tokenizers
             config=self.args,
             generation_config=self.train_generation_config,
