@@ -109,7 +109,7 @@ class PPOStats:
 
 def ppo_micro_batch_updates(
     config: PPOConfig,
-    ppo_epoch_idx,
+    epoch_idx,
     minibatch_idx,
     mini_batch_start: int,
     model,
@@ -236,7 +236,7 @@ def ppo_micro_batch_updates(
                 approximate_kl = 0.5 * (logprobs_diff**2).mean()
                 # create a slice object for the indices that we want to populate
                 update_location = (
-                    ppo_epoch_idx,
+                    epoch_idx,
                     minibatch_idx,
                     gradient_accumulation_idx,
                 )
@@ -379,7 +379,7 @@ def ppo_batch_update(
     # Do multiple epochs of PPO training, using the dataset for this update phase
     # use a fresh random shuffle in each epoch
     # num_epochs_per_batch_update specifies how many times to loop over the PPO dataset.
-    for ppo_epoch_idx in range(config.num_epochs_per_batch_update):
+    for epoch_idx in range(config.num_epochs_per_batch_update):
         # Draw a random permutation
         batch_inds = np.random.permutation(config.local_batch_size)
         for minibatch_idx, mini_batch_start in enumerate(
@@ -389,7 +389,7 @@ def ppo_batch_update(
                 # config!
                 config=config,
                 # integers
-                ppo_epoch_idx=ppo_epoch_idx,
+                epoch_idx=epoch_idx,
                 minibatch_idx=minibatch_idx,
                 mini_batch_start=mini_batch_start,
                 context_length=context_length,

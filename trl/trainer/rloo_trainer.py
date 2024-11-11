@@ -482,7 +482,7 @@ class RLOOTrainer(Trainer):
                 torch.cuda.empty_cache()
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
-            for ppo_epoch_idx in range(args.num_epochs_per_batch_update):
+            for epoch_idx in range(args.num_epochs_per_batch_update):
                 b_inds = np.random.permutation(args.local_batch_size)
                 minibatch_idx = 0
                 for mini_batch_start in range(
@@ -543,27 +543,27 @@ class RLOOTrainer(Trainer):
                                 )
                                 approxkl = 0.5 * (logprobs_diff**2).mean()
                                 approxkl_stats[
-                                    ppo_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = approxkl
                                 pg_clipfrac_stats[
-                                    ppo_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = pg_clipfrac
                                 pg_loss_stats[
-                                    ppo_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = pg_loss
                                 entropy_stats[
-                                    ppo_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = entropy.mean()
                                 ratio_stats[
-                                    ppo_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = new_ratio.mean()

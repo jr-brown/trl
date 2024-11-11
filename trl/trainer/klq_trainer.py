@@ -301,7 +301,7 @@ class KLQTrainer(Trainer):
                 "same as `policy`, you must mass a copy of it, or `None` if you use peft."
             )
 
-        self.args = config
+        self.config = config
         self.processing_class = processing_class
         self.policy = policy
 
@@ -401,7 +401,7 @@ class KLQTrainer(Trainer):
         ### trainer specifics
         #########
         default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(
-            self.args.report_to
+            self.config.report_to
         )
         self.callbacks = (
             default_callbacks if callbacks is None else default_callbacks + callbacks
@@ -414,7 +414,7 @@ class KLQTrainer(Trainer):
             self.lr_scheduler,
         )
         self.add_callback(
-            PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK
+            PrinterCallback if self.config.disable_tqdm else DEFAULT_PROGRESS_CALLBACK
         )
         self.control = TrainerControl()
         self.state = OnlineTrainerState(
@@ -436,10 +436,10 @@ class KLQTrainer(Trainer):
         )
         # Create distant repo and output directory if needed
         self.hub_model_id = None
-        if self.args.push_to_hub:
+        if self.config.push_to_hub:
             self.init_hf_repo()
-        if self.args.should_save:
-            os.makedirs(self.args.output_dir, exist_ok=True)
+        if self.config.should_save:
+            os.makedirs(self.config.output_dir, exist_ok=True)
 
         # Add tags for models that have been loaded with the correct transformers version
         if hasattr(self.model, "add_model_tags"):
@@ -512,7 +512,7 @@ class KLQTrainer(Trainer):
             self.deepspeed = backup_deepspeed
 
     def train(self):
-        config = self.args
+        config = self.config
         accelerator = self.accelerator
         optimizer = self.optimizer
         model = self.model
@@ -762,8 +762,8 @@ class KLQTrainer(Trainer):
                     postprocessed_responses == self.processing_class.eos_token_id,
                     dim=-1,
                 )
-                if self.args.missing_eos_penalty is not None:
-                    scores[~contain_eos_token] -= self.args.missing_eos_penalty
+                if self.config.missing_eos_penalty is not None:
+                    scores[~contain_eos_token] -= self.config.missing_eos_penalty
                 # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
                 # be very careful with `padding_mask_plus_one`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
@@ -848,7 +848,7 @@ class KLQTrainer(Trainer):
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
             # num_epochs_per_batch_update specifies how many times to loop over the PPO dataset.
-            for klq_epoch_idx in range(config.num_epochs_per_batch_update):
+            for epoch_idx in range(config.num_epochs_per_batch_update):
                 # Draw a random permutation
                 batch_inds = np.random.permutation(config.local_batch_size)
                 minibatch_idx = 0
@@ -943,22 +943,22 @@ class KLQTrainer(Trainer):
                             # This is all just for logging.
                             with torch.no_grad():
                                 loss_function_stats[
-                                    klq_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = action_value_function_loss.mean()
                                 action_value_stats[
-                                    klq_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = action_value_prediction.mean()
                                 state_value_stats[
-                                    klq_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = state_value_prediction.mean()
                                 log_ratio_new_ref_stats[
-                                    klq_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = new_ref_log_ratio.mean()
@@ -968,7 +968,7 @@ class KLQTrainer(Trainer):
                                     prob_dist * logits, dim=-1
                                 )
                                 entropy_stats[
-                                    klq_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = entropy.mean()
@@ -982,22 +982,22 @@ class KLQTrainer(Trainer):
                                 new_prev_log_ratio = -prev_new_log_ratio
                                 new_prev_ratio = torch.exp(new_prev_log_ratio)
                                 kl_prev_ref_stats[
-                                    klq_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = prev_ref_log_ratio.mean()
                                 kl_new_ref_stats[
-                                    klq_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = (new_prev_ratio * new_ref_log_ratio).mean()
                                 kl_prev_new_stats[
-                                    klq_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = prev_new_log_ratio.mean()
                                 kl_new_prev_stats[
-                                    klq_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = (new_prev_ratio * new_prev_log_ratio).mean()
@@ -1118,7 +1118,7 @@ class KLQTrainer(Trainer):
             if self.control.should_save:
                 self._save_checkpoint(model, trial=None, metrics=metrics)
                 self.control = self.callback_handler.on_save(
-                    self.args, self.state, self.control
+                    self.config, self.state, self.control
                 )
             del mean_entropy, scores, metrics  # mean_kl, mean_non_score_reward,
             torch.cuda.empty_cache()
@@ -1156,15 +1156,15 @@ class KLQTrainer(Trainer):
         if self.control.should_save:
             self._save_checkpoint(model, trial=None, metrics=None)
             self.control = self.callback_handler.on_save(
-                self.args, self.state, self.control
+                self.config, self.state, self.control
             )
 
     def generate_completions(self, sampling: bool = False):
-        config = self.args
+        config = self.config
         processing_class = self.processing_class
         reward_model_processing_class = self.reward_model_processing_class
         generation_config = GenerationConfig(
-            max_new_tokens=self.args.response_length,
+            max_new_tokens=self.config.response_length,
             temperature=(0.01 + 1e-7),
             top_k=0.0,
             top_p=1.0,
@@ -1302,4 +1302,4 @@ class KLQTrainer(Trainer):
             paper_id="1909.08593",
         )
 
-        model_card.save(os.path.join(self.args.output_dir, "README.md"))
+        model_card.save(os.path.join(self.config.output_dir, "README.md"))

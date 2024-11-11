@@ -638,7 +638,7 @@ class PPOTrainer(Trainer):
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
             # num_epochs_per_batch_update specifies how many times to loop over the PPO dataset.
-            for ppo_epoch_idx in range(config.num_epochs_per_batch_update):
+            for epoch_idx in range(config.num_epochs_per_batch_update):
                 # Draw a random permutation
                 batch_inds = np.random.permutation(config.local_batch_size)
                 minibatch_idx = 0
@@ -771,37 +771,37 @@ class PPOTrainer(Trainer):
                                 )
                                 approximate_kl = 0.5 * (logprobs_diff**2).mean()
                                 approximate_kl_stats[
-                                    ppo_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = approximate_kl
                                 policy_gradient_clipfrac_stats[
-                                    ppo_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = policy_gradient_clipfrac
                                 policy_gradient_loss_stats[
-                                    ppo_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = policy_gradient_loss
                                 value_function_loss_stats[
-                                    ppo_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = value_function_loss
                                 value_function_clipfrac_stats[
-                                    ppo_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = value_function_clipfrac
                                 entropy_stats[
-                                    ppo_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = entropy.mean()
                                 ratio_stats[
-                                    ppo_epoch_idx,
+                                    epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = ratio.mean()

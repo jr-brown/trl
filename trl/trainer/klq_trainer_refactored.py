@@ -562,7 +562,7 @@ def batch_update(
 
     # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
     # num_epochs_per_batch_update specifies how many times to loop over the PPO dataset.
-    for klq_epoch_idx in range(config.num_epochs_per_batch_update):
+    for epoch_idx in range(config.num_epochs_per_batch_update):
         # Draw a random permutation
         batch_inds = np.random.permutation(config.local_batch_size)
         minibatch_idx = 0
@@ -572,7 +572,7 @@ def batch_update(
             micro_batch_updates(
                 config=config,
                 # integers
-                epoch_idx=klq_epoch_idx,
+                epoch_idx=epoch_idx,
                 minibatch_idx=minibatch_idx,
                 mini_batch_start=mini_batch_start,
                 context_length=context_length,
