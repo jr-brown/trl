@@ -43,7 +43,7 @@ _import_structure = {
         "RandomPairwiseJudge",
         "RandomRankJudge",
     ],
-    "klac_trainer": ["KLQTrainer"],
+    "klq_trainer": ["KLQTrainer"],
     "klq_config": ["KLQConfig"],
     "kto_config": ["KTOConfig"],
     "kto_trainer": ["KTOTrainer"],
@@ -121,7 +121,7 @@ if TYPE_CHECKING:
     from .ppo_config import PPOConfig
     from .ppo_trainer import PPOTrainer
     from .klq_config import KLQConfig
-    from .klac_trainer import KLQTrainer
+    from .klq_trainer import KLQTrainer
     from .ppov2_config import PPOv2Config
     from .ppov2_trainer import PPOv2Trainer
     from .reward_config import RewardConfig

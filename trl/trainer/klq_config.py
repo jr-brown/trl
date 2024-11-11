@@ -45,3 +45,4 @@ class KLQConfig(OnPolicyConfig):
     lam: float = 0.95
     loss_function: str = "l2_loss"
     loss_kwargs: Optional[dict] = None
+
