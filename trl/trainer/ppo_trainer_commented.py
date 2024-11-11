@@ -134,7 +134,7 @@ class PPOTrainer(Trainer):
 
         assert processing_class is not None
 
-        self.config = config
+        self.args = config
         self.processing_class = processing_class
         self.policy = policy
 
@@ -234,7 +234,7 @@ class PPOTrainer(Trainer):
         ### trainer specifics
         #########
         default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(
-            self.config.report_to
+            self.args.report_to
         )
         self.callbacks = (
             default_callbacks if callbacks is None else default_callbacks + callbacks
@@ -247,7 +247,7 @@ class PPOTrainer(Trainer):
             self.lr_scheduler,
         )
         self.add_callback(
-            PrinterCallback if self.config.disable_tqdm else DEFAULT_PROGRESS_CALLBACK
+            PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK
         )
         self.control = TrainerControl()
         self.state = OnlineTrainerState(
@@ -269,10 +269,10 @@ class PPOTrainer(Trainer):
         )
         # Create distant repo and output directory if needed
         self.hub_model_id = None
-        if self.config.push_to_hub:
+        if self.args.push_to_hub:
             self.init_hf_repo()
-        if self.config.should_save:
-            os.makedirs(self.config.output_dir, exist_ok=True)
+        if self.args.should_save:
+            os.makedirs(self.args.output_dir, exist_ok=True)
 
         # Add tags for models that have been loaded with the correct transformers version
         if hasattr(self.model, "add_model_tags"):
@@ -345,7 +345,7 @@ class PPOTrainer(Trainer):
             self.deepspeed = backup_deepspeed
 
     def train(self):
-        config = self.config
+        config = self.args
         accelerator = self.accelerator
         optimizer = self.optimizer
         model = self.model
@@ -570,8 +570,8 @@ class PPOTrainer(Trainer):
                     postprocessed_responses == self.processing_class.eos_token_id,
                     dim=-1,
                 )
-                if self.config.missing_eos_penalty is not None:
-                    scores[~contain_eos_token] -= self.config.missing_eos_penalty
+                if self.args.missing_eos_penalty is not None:
+                    scores[~contain_eos_token] -= self.args.missing_eos_penalty
                 # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
                 # be very careful with `padding_mask_plus_one`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
@@ -884,7 +884,7 @@ class PPOTrainer(Trainer):
             if self.control.should_save:
                 self._save_checkpoint(model, trial=None, metrics=metrics)
                 self.control = self.callback_handler.on_save(
-                    self.config, self.state, self.control
+                    self.args, self.state, self.control
                 )
             del (
                 kl,
@@ -932,15 +932,15 @@ class PPOTrainer(Trainer):
         if self.control.should_save:
             self._save_checkpoint(model, trial=None, metrics=None)
             self.control = self.callback_handler.on_save(
-                self.config, self.state, self.control
+                self.args, self.state, self.control
             )
 
     def generate_completions(self, sampling: bool = False):
-        config = self.config
+        config = self.args
         processing_class = self.processing_class
         reward_model_processing_class = self.reward_model_processing_class
         generation_config = GenerationConfig(
-            max_new_tokens=self.config.response_length,
+            max_new_tokens=self.args.response_length,
             temperature=(0.01 + 1e-7),
             top_k=0.0,
             top_p=1.0,
@@ -1077,4 +1077,4 @@ class PPOTrainer(Trainer):
             paper_id="1909.08593",
         )
 
-        model_card.save(os.path.join(self.config.output_dir, "README.md"))
+        model_card.save(os.path.join(self.args.output_dir, "README.md"))
