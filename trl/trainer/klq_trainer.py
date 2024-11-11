@@ -543,7 +543,7 @@ class KLQTrainer(Trainer):
         # num_mini_batches
         # gradient_accumulation_steps
         stats_shape = (
-            config.num_ppo_epochs,
+            config.num_klq_epochs,
             config.num_mini_batches,
             config.gradient_accumulation_steps,
         )
@@ -848,7 +848,7 @@ class KLQTrainer(Trainer):
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
             # num_ppo_epochs specifies how many times to loop over the PPO dataset.
-            for klq_epoch_idx in range(config.num_ppo_epochs):
+            for klq_epoch_idx in range(config.num_klq_epochs):
                 # Draw a random permutation
                 batch_inds = np.random.permutation(config.local_batch_size)
                 minibatch_idx = 0

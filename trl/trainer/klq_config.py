@@ -38,7 +38,7 @@ class KLQConfig(OnPolicyConfig):
 
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     reward_model_path: str = "EleutherAI/pythia-160m"
-    num_ppo_epochs: int = 4
+    num_klq_epochs: int = 4
     whiten_rewards: bool = False
     kl_coef: float = 0.05
     gamma: float = 1.0
