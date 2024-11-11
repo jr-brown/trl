@@ -92,6 +92,7 @@ class PolicyAndValueWrapper(nn.Module):
         logits = self.value_model.score(output.hidden_states[-1])
         return self.policy(**kwargs), logits
 
+
 class OnPolicyStats(ABC):
     def __init__(self, stats_shape: Tuple[int, int, int], device: torch.device):
         self.stats_shape = stats_shape
@@ -162,7 +163,9 @@ class OnPolicyTrainer(ABC, Trainer):
         if (
             config.total_episodes is None
         ):  # allow the users to define episodes in terms of epochs.
-            config.total_episodes = int(config.num_train_epochs * self.train_dataset_len)
+            config.total_episodes = int(
+                config.num_train_epochs * self.train_dataset_len
+            )
         accelerator = Accelerator(
             gradient_accumulation_steps=config.gradient_accumulation_steps
         )
@@ -179,7 +182,9 @@ class OnPolicyTrainer(ABC, Trainer):
             * config.num_mini_batches
         )
         # Total batch size across all processes
-        config.micro_batch_size = int(config.per_device_train_batch_size * config.world_size)
+        config.micro_batch_size = int(
+            config.per_device_train_batch_size * config.world_size
+        )
         config.batch_size = int(config.local_batch_size * config.world_size)
         config.mini_batch_size = exact_div(
             config.batch_size,
@@ -212,7 +217,7 @@ class OnPolicyTrainer(ABC, Trainer):
             )
         self.local_dataloader_batch_size = config.local_batch_size
 
-        #########base_model_uses_position_ids
+        #########
         # setup model, optimizer, and others
         #########
         for module in [policy, ref_policy, value_model, reward_model]:
@@ -307,7 +312,10 @@ class OnPolicyTrainer(ABC, Trainer):
                 config.bf16,
             )
             self.ref_policy = prepare_deepspeed(
-                self.ref_policy, config.per_device_train_batch_size, config.fp16, config.bf16
+                self.ref_policy,
+                config.per_device_train_batch_size,
+                config.fp16,
+                config.bf16,
             )
         else:
             self.ref_policy = self.ref_policy.to(self.accelerator.device)
@@ -337,39 +345,37 @@ class OnPolicyTrainer(ABC, Trainer):
             self.deepspeed = backup_deepspeed
 
     @abstractmethod
-    def _initialise_stats(self) -> Dict[str, torch.Tensor]:
+    def _initialise_stats(self) -> OnPolicyStats:
         pass
 
     @abstractmethod
     def batch_update(
         self,
+        # config-like args
         config: OnPolicyConfig,
         generation_config: GenerationConfig,
         processing_class: ProcessingClass,
         reward_model_processing_class: ProcessingClass,
+        # optimisation / efficiency args
         device: torch.device,
         accelerator: Accelerator,
         optimizer: torch.optim.Optimizer,
+        # stateful models and stats
         model: nn.Module,
         ref_policy: nn.Module,
         reward_model: nn.Module,
         stats: OnPolicyStats,
+        # data for the batch!
         data: Dict[str, torch.Tensor],
     ) -> Tuple[nn.Module, Dict[str, torch.Tensor]]:
         """Returns the updated model and the metrics for the batch."""
         pass
 
     def train(self):
+        """Train the policy (model) and"""
         config = self.args
-        accelerator = self.accelerator
-        model = self.model
-        ref_policy = self.ref_policy
-        reward_model = self.reward_model
-        processing_class = self.processing_class
-        assert processing_class is not None
-        reward_model_processing_class = self.reward_model_processing_class
         dataloader = self.dataloader
-        device = accelerator.device
+        assert self.processing_class is not None
 
         def repeat_generator():
             while True:
@@ -384,10 +390,10 @@ class OnPolicyTrainer(ABC, Trainer):
             do_sample=True,
         )
 
-        accelerator.print("===training policy===")
+        self.accelerator.print("===training policy===")
         start_time = time.time()
         # num_ppo_epochs is the number of epochs for which we train on each PPO dataset for each increment of PPO
-        # num_mini_batches 
+        # num_mini_batches
         # gradient_accumulation_steps
         stats_shape = (
             config.num_ppo_epochs,
@@ -442,18 +448,22 @@ class OnPolicyTrainer(ABC, Trainer):
             self.state.episode += 1 * config.batch_size
             data = next(iter_dataloader)
             model, metrics = self.batch_update(
-                model=model,
-                ref_policy=ref_policy,
-                reward_model=reward_model,
-                data=data,
-                accelerator=accelerator,
-                processing_class=processing_class,
-                reward_model_processing_class=reward_model_processing_class,
+                # config-like args
                 config=config,
                 generation_config=generation_config,
-                device=device,
+                processing_class=self.processing_class,
+                reward_model_processing_class=self.reward_model_processing_class,
+                # optimisation / efficiency args
+                device=self.accelerator.device,
+                accelerator=self.accelerator,
                 optimizer=self.optimizer,
+                # stateful models and stats
+                model=self.model,
+                ref_policy=self.ref_policy,
+                reward_model=self.reward_model,
                 stats=stats,
+                # data for the batch!
+                data=data,
             )
             eps = int(self.state.episode / (time.time() - start_time))
             metrics["eps"] = eps
@@ -526,7 +536,9 @@ class OnPolicyTrainer(ABC, Trainer):
                         config.stop_token_id is not None
                     ):  # handle the edge case when stop_token_id exists but is 0
                         postprocessed_response = truncate_response(
-                            config.stop_token_id, processing_class.pad_token_id, response
+                            config.stop_token_id,
+                            processing_class.pad_token_id,
+                            response,
                         )
                     table["query"].extend(
                         gather_object(
