@@ -108,14 +108,17 @@ class OnPolicyTrainer(ABC, Trainer):
 
     def __init__(
         self,
+        # config and tokenizers
         config: OnPolicyConfig,
-        processing_class: Optional[ProcessingClass],
+        processing_class: ProcessingClass,
+        reward_model_processing_class: ProcessingClass,
+        # models
         policy: nn.Module,
         ref_policy: nn.Module,
         reward_model: nn.Module,
+        value_model: nn.Module,
+        # datasets and loaders
         train_dataset: Dataset,
-        value_model: Optional[nn.Module] = None,
-        reward_model_processing_class: Optional[ProcessingClass] = None,
         data_collator: Optional[DataCollatorWithPadding] = None,
         eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
         # less commonly used
@@ -357,6 +360,19 @@ class OnPolicyTrainer(ABC, Trainer):
             self.ref_policy = self.ref_policy.to(self.accelerator.device)
             self.reward_model = self.reward_model.to(self.accelerator.device)
 
+        #########
+        ### extra stateful setting up added by Lennie 11 Nov
+        #########
+        self.stats = self._initialise_stats()
+
+        self.train_generation_config = GenerationConfig(
+            max_new_tokens=config.response_length,
+            temperature=(config.temperature + 1e-7),
+            top_k=0.0,
+            top_p=1.0,
+            do_sample=True,
+        )
+
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
 
@@ -385,23 +401,8 @@ class OnPolicyTrainer(ABC, Trainer):
         pass
 
     @abstractmethod
-    def batch_update(
+    def _batch_update(
         self,
-        # config-like args
-        config: OnPolicyConfig,
-        generation_config: GenerationConfig,
-        processing_class: ProcessingClass,
-        reward_model_processing_class: ProcessingClass,
-        # optimisation / efficiency args
-        device: torch.device,
-        accelerator: Accelerator,
-        optimizer: torch.optim.Optimizer,
-        # stateful models and stats
-        model: nn.Module,
-        ref_policy: nn.Module,
-        reward_model: nn.Module,
-        stats: OnPolicyStats,
-        # data for the batch!
         data: Dict[str, torch.Tensor],
     ) -> Tuple[nn.Module, Dict[str, torch.Tensor]]:
         """Returns the updated model and the metrics for the batch."""
@@ -418,13 +419,6 @@ class OnPolicyTrainer(ABC, Trainer):
                 yield from dataloader
 
         iter_dataloader = iter(repeat_generator())
-        generation_config = GenerationConfig(
-            max_new_tokens=config.response_length,
-            temperature=(config.temperature + 1e-7),
-            top_k=0.0,
-            top_p=1.0,
-            do_sample=True,
-        )
 
         self.accelerator.print("===training policy===")
         start_time = time.time()
@@ -468,37 +462,15 @@ class OnPolicyTrainer(ABC, Trainer):
             self.deepspeed = self.model
             self.model_wrapped = self.model
 
-        # Initialising stats object
-        # (Lightweight wrapper for a collection of tensors which track statistics over training)
-        stats_shape = (
-            config.num_epochs_per_batch_update,
-            config.num_mini_batches,
-            config.gradient_accumulation_steps,
-        )
-        stats = self._initialise_stats(stats_shape, self.accelerator.device)
-
         # The actual training loop
         for update in range(1, config.num_total_batches + 1):
             self.state.episode += 1 * config.batch_size
             data = next(iter_dataloader)
-            model, metrics = self.batch_update(
-                # config-like args
-                config=config,
-                generation_config=generation_config,
-                processing_class=self.processing_class,
-                reward_model_processing_class=self.reward_model_processing_class,
-                # optimisation / efficiency args
-                device=self.accelerator.device,
-                accelerator=self.accelerator,
-                optimizer=self.optimizer,
-                # stateful models and stats
-                model=self.model,
-                ref_policy=self.ref_policy,
-                reward_model=self.reward_model,
-                stats=stats,
-                # data for the batch!
-                data=data,
-            )
+
+            # Main training function
+            # (see implementations in child classes)
+            model, metrics = self._batch_update(data=data)
+
             eps = int(self.state.episode / (time.time() - start_time))
             metrics["eps"] = eps
             metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
