@@ -133,7 +133,7 @@ class OnPolicyTrainer(ABC, Trainer):
         The PPO code had flexibility for input parsing and terminology that was not immediately
         obvious to us.
         We therefore put some extended notes in this docstring.
-        
+
 
         **Sketch of the PPO training algorithm:**
 
@@ -141,7 +141,7 @@ class OnPolicyTrainer(ABC, Trainer):
         Each batch-update phase uses a `batch` of data from `self.dataloader`
         (see construction of `self.dataloader` in this `__init__` call below)
         and is defined by the `batch_update` method.
-        
+
         Each batch-update proceeds via
         1. Forward rollout
         2. PPO training phase
@@ -471,7 +471,7 @@ class OnPolicyTrainer(ABC, Trainer):
         # Initialising stats object
         # (Lightweight wrapper for a collection of tensors which track statistics over training)
         stats_shape = (
-            config.num_ppo_epochs,
+            config.num_epochs_per_batch_update,
             config.num_mini_batches,
             config.gradient_accumulation_steps,
         )

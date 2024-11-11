@@ -100,7 +100,9 @@ class PPOStats:
         self.policy_gradient_clipfrac_stats[update_location] = policy_gradient_clipfrac
         self.policy_gradient_loss_stats[update_location] = policy_gradient_loss
         self.value_function_loss_stats[update_location] = state_value_function_loss
-        self.value_function_clipfrac_stats[update_location] = state_value_function_clipfrac
+        self.value_function_clipfrac_stats[update_location] = (
+            state_value_function_clipfrac
+        )
         self.entropy_stats[update_location] = entropy_mean
         self.ratio_stats[update_location] = ratio_mean
 
@@ -140,9 +142,7 @@ def ppo_micro_batch_updates(
             # Retrieve the relevant variables for this microbatch
             micro_batch_advantage = advantages[micro_batch_inds]
             micro_batch_responses = responses[micro_batch_inds]
-            micro_batch_query_responses = query_responses[
-                micro_batch_inds
-            ]
+            micro_batch_query_responses = query_responses[micro_batch_inds]
             micro_batch_logprobs = logprobs[micro_batch_inds]
             micro_batch_return = returns[micro_batch_inds]
             micro_batch_state_values = state_values[micro_batch_inds]
@@ -201,14 +201,9 @@ def ppo_micro_batch_updates(
             # Compute the policy gradient loss term.
             logprobs_diff = new_logprobs - micro_batch_logprobs
             ratio = torch.exp(logprobs_diff)
-            policy_gradient_losses_unclipped = (
-                -micro_batch_advantage * ratio
-            )
-            policy_gradient_losses_clipped = (
-                -micro_batch_advantage
-                * torch.clamp(
-                    ratio, 1.0 - config.cliprange, 1.0 + config.cliprange
-                )
+            policy_gradient_losses_unclipped = -micro_batch_advantage * ratio
+            policy_gradient_losses_clipped = -micro_batch_advantage * torch.clamp(
+                ratio, 1.0 - config.cliprange, 1.0 + config.cliprange
             )
             policy_gradient_losses_max = torch.max(
                 policy_gradient_losses_unclipped,
@@ -218,10 +213,7 @@ def ppo_micro_batch_updates(
                 policy_gradient_losses_max,
                 ~padding_mask[micro_batch_inds],
             )
-            loss = (
-                policy_gradient_loss
-                + config.vf_coef * state_value_function_loss
-            )
+            loss = policy_gradient_loss + config.vf_coef * state_value_function_loss
 
             # Perform the update step.
             accelerator.backward(loss)
@@ -283,9 +275,7 @@ def ppo_batch_update(
         queries = data["input_ids"].to(device)
         context_length = queries.shape[1]
 
-        with unwrap_model_for_generation(
-            model, accelerator
-        ) as unwrapped_model:
+        with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
             # query_respones and logitss are both torch Tensors.
             # query_responses has shape [batch, query_length]
             # logitss has shape [batch, response_length, vocabulary size]
@@ -340,9 +330,7 @@ def ppo_batch_update(
         ).repeat(responses.shape[0], 1)
         padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
         logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-        ref_logprobs = torch.masked_fill(
-            ref_logprobs, padding_mask, INVALID_LOGPROB
-        )
+        ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
         sequence_lengths_plus_one = sequence_lengths + 1
         padding_mask_plus_one = response_idxs > (sequence_lengths_plus_one.unsqueeze(1))
         state_values = torch.masked_fill(state_values, padding_mask_plus_one, 0)
@@ -390,13 +378,13 @@ def ppo_batch_update(
 
     # Do multiple epochs of PPO training, using the dataset for this update phase
     # use a fresh random shuffle in each epoch
-    # num_ppo_epochs specifies how many times to loop over the PPO dataset.
-    for ppo_epoch_idx in range(config.num_ppo_epochs):
+    # num_epochs_per_batch_update specifies how many times to loop over the PPO dataset.
+    for ppo_epoch_idx in range(config.num_epochs_per_batch_update):
         # Draw a random permutation
         batch_inds = np.random.permutation(config.local_batch_size)
-        for minibatch_idx, mini_batch_start in enumerate(range(
-            0, config.local_batch_size, config.local_mini_batch_size
-        )):
+        for minibatch_idx, mini_batch_start in enumerate(
+            range(0, config.local_batch_size, config.local_mini_batch_size)
+        ):
             ppo_micro_batch_updates(
                 # config!
                 config=config,
@@ -435,18 +423,18 @@ def ppo_batch_update(
         # Refactor the metric caching to make it easier to parse
         s = ppo_stats
         metrics_gathered_and_meaned = {
-            'objective/kl': mean_kl,
-            'objective/entropy': mean_entropy,
-            'objective/non_score_reward': mean_non_score_reward,
-            'objective/rlhf_reward': rlhf_reward,
-            'objective/scores': scores.mean(),
-            'policy/approximate_kl_avg': s.approximate_kl_stats,
-            'policy/clipfrac_avg': s.policy_gradient_clipfrac_stats,
-            'loss/policy_avg': s.policy_gradient_loss_stats,
-            'loss/value_avg': s.value_function_loss_stats,
-            'val/clipfrac_avg': s.value_function_clipfrac_stats,
-            'policy/entropy_avg': s.entropy_stats,
-            'val/ratio': s.ratio_stats,
+            "objective/kl": mean_kl,
+            "objective/entropy": mean_entropy,
+            "objective/non_score_reward": mean_non_score_reward,
+            "objective/rlhf_reward": rlhf_reward,
+            "objective/scores": scores.mean(),
+            "policy/approximate_kl_avg": s.approximate_kl_stats,
+            "policy/clipfrac_avg": s.policy_gradient_clipfrac_stats,
+            "loss/policy_avg": s.policy_gradient_loss_stats,
+            "loss/value_avg": s.value_function_loss_stats,
+            "val/clipfrac_avg": s.value_function_clipfrac_stats,
+            "policy/entropy_avg": s.entropy_stats,
+            "val/ratio": s.ratio_stats,
         }
         for m_name, m_tensor in metrics_gathered_and_meaned.items():
             metrics[m_name] = accelerator.gather(m_tensor).mean().item()
@@ -536,7 +524,9 @@ class PPOTrainer(Trainer):
         if (
             config.total_episodes is None
         ):  # allow the users to define episodes in terms of epochs.
-            config.total_episodes = int(config.num_train_epochs * self.train_dataset_len)
+            config.total_episodes = int(
+                config.num_train_epochs * self.train_dataset_len
+            )
         accelerator = Accelerator(
             gradient_accumulation_steps=config.gradient_accumulation_steps
         )
@@ -553,7 +543,9 @@ class PPOTrainer(Trainer):
             * config.num_mini_batches
         )
         # Total batch size across all processes
-        config.micro_batch_size = int(config.per_device_train_batch_size * config.world_size)
+        config.micro_batch_size = int(
+            config.per_device_train_batch_size * config.world_size
+        )
         config.batch_size = int(config.local_batch_size * config.world_size)
         config.mini_batch_size = exact_div(
             config.batch_size,
@@ -681,7 +673,10 @@ class PPOTrainer(Trainer):
                 config.bf16,
             )
             self.ref_policy = prepare_deepspeed(
-                self.ref_policy, config.per_device_train_batch_size, config.fp16, config.bf16
+                self.ref_policy,
+                config.per_device_train_batch_size,
+                config.fp16,
+                config.bf16,
             )
         else:
             self.ref_policy = self.ref_policy.to(self.accelerator.device)
@@ -738,11 +733,11 @@ class PPOTrainer(Trainer):
 
         accelerator.print("===training policy===")
         start_time = time.time()
-        # num_ppo_epochs is the number of epochs for which we train on each PPO dataset for each increment of PPO
-        # num_mini_batches 
+        # num_epochs_per_batch_update is the number of epochs for which we train on each PPO dataset for each increment of PPO
+        # num_mini_batches
         # gradient_accumulation_steps
         stats_shape = (
-            config.num_ppo_epochs,
+            config.num_epochs_per_batch_update,
             config.num_mini_batches,
             config.gradient_accumulation_steps,
         )
@@ -877,7 +872,9 @@ class PPOTrainer(Trainer):
                         config.stop_token_id is not None
                     ):  # handle the edge case when stop_token_id exists but is 0
                         postprocessed_response = truncate_response(
-                            config.stop_token_id, processing_class.pad_token_id, response
+                            config.stop_token_id,
+                            processing_class.pad_token_id,
+                            response,
                         )
                     table["query"].extend(
                         gather_object(

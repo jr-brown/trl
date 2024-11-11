@@ -48,7 +48,7 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
     --dataset_name trl-internal-testing/tldr-preference-sft-trl-style \
     --dataset_test_split validation \
     --output_dir models/minimal/rloo_tldr \
-    --num_ppo_epochs 1 \
+    --num_epochs_per_batch_update 1 \
     --num_mini_batches 1 \
     --learning_rate 3e-6 \
     --per_device_train_batch_size 16 \
@@ -81,7 +81,9 @@ if __name__ == "__main__":
     if tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
     reward_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_config.trust_remote_code, num_labels=1
+        training_args.reward_model_path,
+        trust_remote_code=model_config.trust_remote_code,
+        num_labels=1,
     )
     ref_policy = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_config.trust_remote_code
@@ -119,10 +121,16 @@ if __name__ == "__main__":
         train_dataset = prepare_dataset(train_dataset, tokenizer)
         eval_dataset = prepare_dataset(eval_dataset, tokenizer)
         # filtering
-        train_dataset = train_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
-        eval_dataset = eval_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
+        train_dataset = train_dataset.filter(
+            lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc
+        )
+        eval_dataset = eval_dataset.filter(
+            lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc
+        )
 
-    assert train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id, "The last token should not be an EOS token"
+    assert (
+        train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id
+    ), "The last token should not be an EOS token"
     ################
     # Training
     ################

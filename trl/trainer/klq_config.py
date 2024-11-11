@@ -20,7 +20,7 @@ class KLQConfig(OnPolicyConfig):
             Name of this experiment.
         reward_model_path (`str`, *optional*, defaults to `"EleutherAI/pythia-160m"`):
             Path to the reward model.
-        num_ppo_epochs (`int`, *optional*, defaults to `4`):
+        num_epochs_per_batch_update (`int`, *optional*, defaults to `4`):
             Number of epochs to train.
         whiten_rewards (`bool`, *optional*, defaults to `False`):
             Whether to whiten the rewards.
@@ -38,7 +38,7 @@ class KLQConfig(OnPolicyConfig):
 
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     reward_model_path: str = "EleutherAI/pythia-160m"
-    num_ppo_epochs: int = 4
+    num_epochs_per_batch_update: int = 4
     whiten_rewards: bool = False
     kl_coef: float = 0.05
     gamma: float = 1.0

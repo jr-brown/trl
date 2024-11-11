@@ -43,7 +43,11 @@ from transformers import (
 )
 from transformers.integrations import get_reporting_integration_callbacks
 from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
-from transformers.trainer_callback import CallbackHandler, ExportableState, PrinterCallback
+from transformers.trainer_callback import (
+    CallbackHandler,
+    ExportableState,
+    PrinterCallback,
+)
 
 from ..models.utils import unwrap_model_for_generation
 from ..trainer.utils import (
@@ -75,7 +79,12 @@ class RLOOTrainer(Trainer):
         self,
         config: RLOOConfig,
         processing_class: Optional[
-            Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]
+            Union[
+                PreTrainedTokenizerBase,
+                BaseImageProcessor,
+                FeatureExtractionMixin,
+                ProcessorMixin,
+            ]
         ],
         policy: nn.Module,
         ref_policy: nn.Module,
@@ -84,7 +93,10 @@ class RLOOTrainer(Trainer):
         data_collator: Optional[DataCollatorWithPadding] = None,
         eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
         # less commonly used
-        optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
+        optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (
+            None,
+            None,
+        ),
         callbacks: Optional[List[TrainerCallback]] = None,
     ) -> None:
         if ref_policy is policy:
@@ -101,7 +113,9 @@ class RLOOTrainer(Trainer):
         self.policy.generation_config.eos_token_id = (
             None  # disable `pad_token_id` and `eos_token_id` because we just want to
         )
-        self.policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
+        self.policy.generation_config.pad_token_id = (
+            None  # generate tokens without truncation / padding
+        )
 
         self.ref_policy = ref_policy
         self.reward_model = reward_model
@@ -114,33 +128,49 @@ class RLOOTrainer(Trainer):
         #########
         # calculate various batch sizes
         #########
-        if args.total_episodes is None:  # allow the users to define episodes in terms of epochs.
+        if (
+            args.total_episodes is None
+        ):  # allow the users to define episodes in terms of epochs.
             args.total_episodes = int(args.num_train_epochs * self.train_dataset_len)
-        accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+        accelerator = Accelerator(
+            gradient_accumulation_steps=args.gradient_accumulation_steps
+        )
         self.accelerator = accelerator
         args.world_size = accelerator.num_processes
         args.local_batch_size = (
-            args.per_device_train_batch_size * args.gradient_accumulation_steps * args.num_mini_batches
+            args.per_device_train_batch_size
+            * args.gradient_accumulation_steps
+            * args.num_mini_batches
         )
         args.micro_batch_size = int(args.per_device_train_batch_size * args.world_size)
         args.batch_size = int(args.local_batch_size * args.world_size)
         args.mini_batch_size = exact_div(
-            args.batch_size, args.num_mini_batches, "`batch_size` must be a multiple of `num_mini_batches`"
+            args.batch_size,
+            args.num_mini_batches,
+            "`batch_size` must be a multiple of `num_mini_batches`",
         )
         args.local_mini_batch_size = exact_div(
-            args.local_batch_size, args.num_mini_batches, "`local_batch_size` must be a multiple of `num_mini_batches`"
+            args.local_batch_size,
+            args.num_mini_batches,
+            "`local_batch_size` must be a multiple of `num_mini_batches`",
         )
         args.num_total_batches = math.ceil(
             args.total_episodes / args.batch_size
         )  # we may train for more than `total_episodes`
         time_tensor = torch.tensor(int(time.time()), device=accelerator.device)
-        time_int = broadcast(time_tensor, 0).item()  # avoid different timestamps across processes
+        time_int = broadcast(
+            time_tensor, 0
+        ).item()  # avoid different timestamps across processes
         args.run_name = f"{args.exp_name}__{args.seed}__{time_int}"
         self.local_seed = args.seed + accelerator.process_index * 100003  # Prime
         if args.num_sample_generations > 0:
-            self.sample_generations_freq = max(1, args.num_total_batches // args.num_sample_generations)
+            self.sample_generations_freq = max(
+                1, args.num_total_batches // args.num_sample_generations
+            )
         self.local_dataloader_batch_size = exact_div(
-            args.local_batch_size, args.rloo_k, "`local_batch_size` must be a multiple of rloo_k"
+            args.local_batch_size,
+            args.rloo_k,
+            "`local_batch_size` must be a multiple of rloo_k",
         )  # RLOO logic: needed because RLOO repeats the same prompt args.rloo_k times
 
         #########
@@ -158,25 +188,41 @@ class RLOOTrainer(Trainer):
         #########
         ### trainer specifics
         #########
-        default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(self.args.report_to)
-        self.callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
-        self.callback_handler = CallbackHandler(
-            self.callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
+        default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(
+            self.args.report_to
         )
-        self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
+        self.callbacks = (
+            default_callbacks if callbacks is None else default_callbacks + callbacks
+        )
+        self.callback_handler = CallbackHandler(
+            self.callbacks,
+            self.model,
+            self.processing_class,
+            self.optimizer,
+            self.lr_scheduler,
+        )
+        self.add_callback(
+            PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK
+        )
         self.control = TrainerControl()
         self.state = OnlineTrainerState(
             is_local_process_zero=self.is_local_process_zero(),
             is_world_process_zero=self.is_world_process_zero(),
             stateful_callbacks=[
-                cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)
+                cb
+                for cb in self.callback_handler.callbacks + [self.control]
+                if isinstance(cb, ExportableState)
             ],
         )
 
         self.current_flos = 0
         self.hp_search_backend = None
-        self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
-        self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        self.is_deepspeed_enabled = (
+            getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+        )
+        self.is_fsdp_enabled = (
+            getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        )
         # Create distant repo and output directory if needed
         self.hub_model_id = None
         if self.args.push_to_hub:
@@ -202,7 +248,9 @@ class RLOOTrainer(Trainer):
         # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
         # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
         torch.manual_seed(args.seed)
-        self.model, self.optimizer, self.dataloader = accelerator.prepare(self.model, self.optimizer, self.dataloader)
+        self.model, self.optimizer, self.dataloader = accelerator.prepare(
+            self.model, self.optimizer, self.dataloader
+        )
         torch.manual_seed(self.local_seed)  # reset the local seed again
 
         self.eval_dataloader = DataLoader(
@@ -215,7 +263,10 @@ class RLOOTrainer(Trainer):
 
         if self.is_deepspeed_enabled:
             self.reward_model = prepare_deepspeed(
-                self.reward_model, args.per_device_train_batch_size, args.fp16, args.bf16
+                self.reward_model,
+                args.per_device_train_batch_size,
+                args.fp16,
+                args.bf16,
             )
             self.ref_policy = prepare_deepspeed(
                 self.ref_policy, args.per_device_train_batch_size, args.fp16, args.bf16
@@ -258,7 +309,11 @@ class RLOOTrainer(Trainer):
 
         accelerator.print("===training policy===")
         start_time = time.time()
-        stats_shape = (args.num_ppo_epochs, args.num_mini_batches, args.gradient_accumulation_steps)
+        stats_shape = (
+            args.num_epochs_per_batch_update,
+            args.num_mini_batches,
+            args.gradient_accumulation_steps,
+        )
         approxkl_stats = torch.zeros(stats_shape, device=device)
         pg_clipfrac_stats = torch.zeros(stats_shape, device=device)
         pg_loss_stats = torch.zeros(stats_shape, device=device)
@@ -276,20 +331,28 @@ class RLOOTrainer(Trainer):
         # Compute absolute values for logging, eval, and save if given as ratio
         if args.logging_steps is not None:
             if args.logging_steps < 1:
-                self.state.logging_steps = math.ceil(self.state.max_steps * args.logging_steps)
+                self.state.logging_steps = math.ceil(
+                    self.state.max_steps * args.logging_steps
+                )
             else:
                 self.state.logging_steps = args.logging_steps
         if args.eval_steps is not None:
             if args.eval_steps < 1:
-                self.state.eval_steps = math.ceil(self.state.max_steps * args.eval_steps)
+                self.state.eval_steps = math.ceil(
+                    self.state.max_steps * args.eval_steps
+                )
             else:
                 self.state.eval_steps = args.eval_steps
         if args.save_steps is not None:
             if args.save_steps < 1:
-                self.state.save_steps = math.ceil(self.state.max_steps * args.save_steps)
+                self.state.save_steps = math.ceil(
+                    self.state.max_steps * args.save_steps
+                )
             else:
                 self.state.save_steps = args.save_steps
-        self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
+        self.control = self.callback_handler.on_train_begin(
+            args, self.state, self.control
+        )
 
         for update in range(1, args.num_total_batches + 1):
             self.state.episode += 1 * args.batch_size
@@ -305,7 +368,9 @@ class RLOOTrainer(Trainer):
                 ref_logprobs = []
                 scores = []
                 sequence_lengths = []
-                with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                with unwrap_model_for_generation(
+                    model, self.accelerator
+                ) as unwrapped_model:
                     query_responses, logitss = batch_generation(
                         unwrapped_model,
                         queries,
@@ -314,36 +379,58 @@ class RLOOTrainer(Trainer):
                         generation_config,
                     )
 
-                for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
+                for i in range(
+                    0, queries.shape[0], args.local_rollout_forward_batch_size
+                ):
                     query = queries[i : i + args.local_rollout_forward_batch_size]
-                    query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
+                    query_response = query_responses[
+                        i : i + args.local_rollout_forward_batch_size
+                    ]
                     response = query_response[:, context_length:]
                     logits = logitss[i : i + args.local_rollout_forward_batch_size]
                     all_logprob = F.log_softmax(logits, dim=-1)
-                    logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
+                    logprob = torch.gather(
+                        all_logprob, 2, response.unsqueeze(-1)
+                    ).squeeze(-1)
                     del logits, all_logprob
                     torch.cuda.empty_cache()
 
-                    ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
+                    ref_output = forward(
+                        ref_policy, query_response, processing_class.pad_token_id
+                    )
                     ref_logits = ref_output.logits[:, context_length - 1 : -1]
                     ref_logits /= args.temperature + 1e-7
                     ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
-                    ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
+                    ref_logprob = torch.gather(
+                        ref_all_logprob, 2, response.unsqueeze(-1)
+                    ).squeeze(-1)
                     del ref_output, ref_logits, ref_all_logprob
                     torch.cuda.empty_cache()
 
                     # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
                     postprocessed_response = response
-                    if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
+                    if (
+                        args.stop_token_id is not None
+                    ):  # handle the edge case when stop_token_id exists but is 0
                         postprocessed_response = truncate_response(
                             args.stop_token_id, processing_class.pad_token_id, response
                         )
 
                     # Response Processing 2. run reward model on the truncated responses
-                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
+                    postprocessed_query_response = torch.cat(
+                        (query, postprocessed_response), 1
+                    )
+                    sequence_length = (
+                        first_true_indices(
+                            postprocessed_response == processing_class.pad_token_id
+                        )
+                        - 1
+                    )
                     _, score, _ = get_reward(
-                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                        reward_model,
+                        postprocessed_query_response,
+                        processing_class.pad_token_id,
+                        context_length,
                     )
 
                     responses.append(response)
@@ -365,16 +452,22 @@ class RLOOTrainer(Trainer):
                 # Response Processing 3. filter response. Ensure that the sample contains stop_token_id
                 # responses not passing that filter will receive a low (fixed) score
                 # only query humans on responses that pass that filter
-                contain_eos_token = torch.any(postprocessed_responses == processing_class.eos_token_id, dim=-1)
+                contain_eos_token = torch.any(
+                    postprocessed_responses == processing_class.eos_token_id, dim=-1
+                )
                 if args.missing_eos_penalty is not None:
                     scores[~contain_eos_token] -= self.args.missing_eos_penalty
                 # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
-                response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
+                response_idxs = torch.arange(
+                    responses.shape[1], device=responses.device
+                ).repeat(responses.shape[0], 1)
                 padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
                 logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-                ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
+                ref_logprobs = torch.masked_fill(
+                    ref_logprobs, padding_mask, INVALID_LOGPROB
+                )
 
                 # 4. compute rewards
                 kl = logprobs - ref_logprobs
@@ -389,29 +482,43 @@ class RLOOTrainer(Trainer):
                 torch.cuda.empty_cache()
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
-            for ppo_epoch_idx in range(args.num_ppo_epochs):
+            for ppo_epoch_idx in range(args.num_epochs_per_batch_update):
                 b_inds = np.random.permutation(args.local_batch_size)
                 minibatch_idx = 0
-                for mini_batch_start in range(0, args.local_batch_size, args.local_mini_batch_size):
+                for mini_batch_start in range(
+                    0, args.local_batch_size, args.local_mini_batch_size
+                ):
                     mini_batch_end = mini_batch_start + args.local_mini_batch_size
                     mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
                     gradient_accumulation_idx = 0
-                    for micro_batch_start in range(0, args.local_mini_batch_size, args.per_device_train_batch_size):
+                    for micro_batch_start in range(
+                        0, args.local_mini_batch_size, args.per_device_train_batch_size
+                    ):
                         with accelerator.accumulate(model):
-                            micro_batch_end = micro_batch_start + args.per_device_train_batch_size
-                            micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
+                            micro_batch_end = (
+                                micro_batch_start + args.per_device_train_batch_size
+                            )
+                            micro_batch_inds = mini_batch_inds[
+                                micro_batch_start:micro_batch_end
+                            ]
                             mb_advantage = advantages[micro_batch_inds]
                             mb_responses = responses[micro_batch_inds]
                             mb_query_responses = query_responses[micro_batch_inds]
                             mb_logprobs = logprobs[micro_batch_inds]
 
-                            output = forward(model, mb_query_responses, processing_class.pad_token_id)
+                            output = forward(
+                                model, mb_query_responses, processing_class.pad_token_id
+                            )
                             logits = output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
                             new_all_logprobs = F.log_softmax(logits, dim=-1)
-                            new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
+                            new_logprobs = torch.gather(
+                                new_all_logprobs, 2, mb_responses.unsqueeze(-1)
+                            ).squeeze(-1)
                             new_logprobs = torch.masked_fill(
-                                new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
+                                new_logprobs,
+                                padding_mask[micro_batch_inds],
+                                INVALID_LOGPROB,
                             )
                             new_ratio = (new_logprobs - mb_logprobs).exp()
                             new_logprobs = new_logprobs.sum(1)
@@ -419,7 +526,9 @@ class RLOOTrainer(Trainer):
                             logprobs_diff = new_logprobs - mb_logprobs
                             ratio = torch.exp(logprobs_diff)
                             pg_losses = -mb_advantage * ratio
-                            pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
+                            pg_losses2 = -mb_advantage * torch.clamp(
+                                ratio, 1.0 - args.cliprange, 1.0 + args.cliprange
+                            )
                             pg_loss_max = torch.max(pg_losses, pg_losses2)
                             pg_loss = pg_loss_max.mean()
                             loss = pg_loss
@@ -429,15 +538,35 @@ class RLOOTrainer(Trainer):
                             with torch.no_grad():
                                 pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
                                 prob_dist = torch.nn.functional.softmax(logits, dim=-1)
-                                entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
-                                approxkl = 0.5 * (logprobs_diff**2).mean()
-                                approxkl_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
-                                pg_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
-                                    pg_clipfrac
+                                entropy = torch.logsumexp(logits, dim=-1) - torch.sum(
+                                    prob_dist * logits, dim=-1
                                 )
-                                pg_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
-                                entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
-                                ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = new_ratio.mean()
+                                approxkl = 0.5 * (logprobs_diff**2).mean()
+                                approxkl_stats[
+                                    ppo_epoch_idx,
+                                    minibatch_idx,
+                                    gradient_accumulation_idx,
+                                ] = approxkl
+                                pg_clipfrac_stats[
+                                    ppo_epoch_idx,
+                                    minibatch_idx,
+                                    gradient_accumulation_idx,
+                                ] = pg_clipfrac
+                                pg_loss_stats[
+                                    ppo_epoch_idx,
+                                    minibatch_idx,
+                                    gradient_accumulation_idx,
+                                ] = pg_loss
+                                entropy_stats[
+                                    ppo_epoch_idx,
+                                    minibatch_idx,
+                                    gradient_accumulation_idx,
+                                ] = entropy.mean()
+                                ratio_stats[
+                                    ppo_epoch_idx,
+                                    minibatch_idx,
+                                    gradient_accumulation_idx,
+                                ] = new_ratio.mean()
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
                     self.state.global_step += 1
@@ -459,42 +588,81 @@ class RLOOTrainer(Trainer):
                 metrics = {}
                 metrics["eps"] = eps
                 metrics["objective/kl"] = self.accelerator.gather(mean_kl).mean().item()
-                metrics["objective/entropy"] = self.accelerator.gather(mean_entropy).mean().item()
-                metrics["objective/non_score_reward"] = self.accelerator.gather(mean_non_score_reward).mean().item()
-                metrics["objective/rlhf_reward"] = self.accelerator.gather(rlhf_reward).mean().item()
-                metrics["objective/scores"] = self.accelerator.gather(scores.mean()).mean().item()
-                metrics["policy/approxkl_avg"] = self.accelerator.gather(approxkl_stats).mean().item()
-                metrics["policy/clipfrac_avg"] = self.accelerator.gather(pg_clipfrac_stats).mean().item()
-                metrics["loss/policy_avg"] = self.accelerator.gather(pg_loss_stats).mean().item()
-                metrics["loss/value_avg"] = self.accelerator.gather(vf_loss_stats).mean().item()
-                metrics["val/clipfrac_avg"] = self.accelerator.gather(vf_clipfrac_stats).mean().item()
-                metrics["policy/entropy_avg"] = self.accelerator.gather(entropy_stats).mean().item()
-                metrics["val/ratio"] = self.accelerator.gather(ratio_stats).mean().item()
-                metrics["val/ratio_var"] = self.accelerator.gather(ratio_stats).var().item()
-                metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
+                metrics["objective/entropy"] = (
+                    self.accelerator.gather(mean_entropy).mean().item()
+                )
+                metrics["objective/non_score_reward"] = (
+                    self.accelerator.gather(mean_non_score_reward).mean().item()
+                )
+                metrics["objective/rlhf_reward"] = (
+                    self.accelerator.gather(rlhf_reward).mean().item()
+                )
+                metrics["objective/scores"] = (
+                    self.accelerator.gather(scores.mean()).mean().item()
+                )
+                metrics["policy/approxkl_avg"] = (
+                    self.accelerator.gather(approxkl_stats).mean().item()
+                )
+                metrics["policy/clipfrac_avg"] = (
+                    self.accelerator.gather(pg_clipfrac_stats).mean().item()
+                )
+                metrics["loss/policy_avg"] = (
+                    self.accelerator.gather(pg_loss_stats).mean().item()
+                )
+                metrics["loss/value_avg"] = (
+                    self.accelerator.gather(vf_loss_stats).mean().item()
+                )
+                metrics["val/clipfrac_avg"] = (
+                    self.accelerator.gather(vf_clipfrac_stats).mean().item()
+                )
+                metrics["policy/entropy_avg"] = (
+                    self.accelerator.gather(entropy_stats).mean().item()
+                )
+                metrics["val/ratio"] = (
+                    self.accelerator.gather(ratio_stats).mean().item()
+                )
+                metrics["val/ratio_var"] = (
+                    self.accelerator.gather(ratio_stats).var().item()
+                )
+                metrics["val/num_eos_tokens"] = (
+                    (responses == processing_class.eos_token_id).sum().item()
+                )
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
-                self.state.epoch = self.state.episode / self.train_dataset_len  # used by self.log
+                self.state.epoch = (
+                    self.state.episode / self.train_dataset_len
+                )  # used by self.log
                 self.state.global_step += 1
                 self.log(metrics)
             del kl, mean_kl, mean_entropy, scores
 
             self.lr_scheduler.step()
-            self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+            self.control = self.callback_handler.on_step_end(
+                args, self.state, self.control
+            )
             if self.control.should_save:
                 self._save_checkpoint(model, trial=None, metrics=metrics)
-                self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+                self.control = self.callback_handler.on_save(
+                    self.args, self.state, self.control
+                )
             torch.cuda.empty_cache()
             gc.collect()
 
-            if args.num_sample_generations > 0 and (update - 1) % self.sample_generations_freq == 0:
+            if (
+                args.num_sample_generations > 0
+                and (update - 1) % self.sample_generations_freq == 0
+            ):
                 self.generate_completions(sampling=True)
 
         # HF trainer specifics
-        self.control = self.callback_handler.on_train_end(args, self.state, self.control)
+        self.control = self.callback_handler.on_train_end(
+            args, self.state, self.control
+        )
         if self.control.should_save:
             self._save_checkpoint(model, trial=None, metrics=None)
-            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+            self.control = self.callback_handler.on_save(
+                self.args, self.state, self.control
+            )
 
     def generate_completions(self, sampling: bool = False):
         args = self.args
@@ -508,7 +676,9 @@ class RLOOTrainer(Trainer):
         )
 
         table = defaultdict(list)
-        with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+        with unwrap_model_for_generation(
+            self.model, self.accelerator
+        ) as unwrapped_model:
             for batch in self.eval_dataloader:
                 query = batch["input_ids"]
                 with torch.no_grad():
@@ -522,22 +692,37 @@ class RLOOTrainer(Trainer):
                     )
                     response = query_response[:, context_length:]
                     postprocessed_response = response
-                    if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
+                    if (
+                        args.stop_token_id is not None
+                    ):  # handle the edge case when stop_token_id exists but is 0
                         postprocessed_response = truncate_response(
                             args.stop_token_id, processing_class.pad_token_id, response
                         )
                     table["query"].extend(
-                        gather_object(processing_class.batch_decode(query, skip_special_tokens=True))
+                        gather_object(
+                            processing_class.batch_decode(
+                                query, skip_special_tokens=True
+                            )
+                        )
                     )
                     table["model response"].extend(
-                        gather_object(processing_class.batch_decode(postprocessed_response))
+                        gather_object(
+                            processing_class.batch_decode(postprocessed_response)
+                        )
                     )
 
-                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    _, score, _ = get_reward(
-                        self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    postprocessed_query_response = torch.cat(
+                        (query, postprocessed_response), 1
                     )
-                    table["score"].extend(self.accelerator.gather(score).float().cpu().numpy())
+                    _, score, _ = get_reward(
+                        self.reward_model,
+                        postprocessed_query_response,
+                        processing_class.pad_token_id,
+                        context_length,
+                    )
+                    table["score"].extend(
+                        self.accelerator.gather(score).float().cpu().numpy()
+                    )
 
                 if sampling:
                     break
@@ -571,7 +756,9 @@ class RLOOTrainer(Trainer):
         if not self.is_world_process_zero():
             return
 
-        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(self.model.config._name_or_path):
+        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(
+            self.model.config._name_or_path
+        ):
             base_model = self.model.config._name_or_path
         else:
             base_model = None
@@ -583,7 +770,8 @@ class RLOOTrainer(Trainer):
         if hasattr(self.model.config, "unsloth_version"):
             tags.append("unsloth")
 
-        citation = textwrap.dedent("""\
+        citation = textwrap.dedent(
+            """\
         @inproceedings{ahmadian2024back,
             title        = {{Back to Basics: Revisiting REINFORCE-Style Optimization for Learning from Human Feedback in LLMs}},
             author       = {Arash Ahmadian and Chris Cremer and Matthias Gall{\'{e}} and Marzieh Fadaee and Julia Kreutzer and Olivier Pietquin and Ahmet {\"{U}}st{\"{u}}n and Sara Hooker},
@@ -592,7 +780,8 @@ class RLOOTrainer(Trainer):
             publisher    = {Association for Computational Linguistics},
             pages        = {12248--12267},
             editor       = {Lun{-}Wei Ku and Andre Martins and Vivek Srikumar},
-        }""")
+        }"""
+        )
 
         model_card = generate_model_card(
             base_model=base_model,
@@ -600,7 +789,11 @@ class RLOOTrainer(Trainer):
             hub_model_id=self.hub_model_id,
             dataset_name=dataset_name,
             tags=tags,
-            wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
+            wandb_url=(
+                wandb.run.get_url()
+                if is_wandb_available() and wandb.run is not None
+                else None
+            ),
             trainer_name="RLOO",
             trainer_citation=citation,
             paper_title="Back to Basics: Revisiting REINFORCE-Style Optimization for Learning from Human Feedback in LLMs",

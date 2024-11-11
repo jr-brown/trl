@@ -539,11 +539,11 @@ class KLQTrainer(Trainer):
 
         accelerator.print("===training policy===")
         start_time = time.time()
-        # num_ppo_epochs is the number of epochs for which we train on the PPO dataset for each increment of PPO
+        # num_epochs_per_batch_update is the number of epochs for which we train on the PPO dataset for each increment of PPO
         # num_mini_batches
         # gradient_accumulation_steps
         stats_shape = (
-            config.num_ppo_epochs,
+            config.num_epochs_per_batch_update,
             config.num_mini_batches,
             config.gradient_accumulation_steps,
         )
@@ -847,8 +847,8 @@ class KLQTrainer(Trainer):
                 torch.cuda.empty_cache()
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
-            # num_ppo_epochs specifies how many times to loop over the PPO dataset.
-            for klq_epoch_idx in range(config.num_ppo_epochs):
+            # num_epochs_per_batch_update specifies how many times to loop over the PPO dataset.
+            for klq_epoch_idx in range(config.num_epochs_per_batch_update):
                 # Draw a random permutation
                 batch_inds = np.random.permutation(config.local_batch_size)
                 minibatch_idx = 0

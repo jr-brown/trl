@@ -44,7 +44,7 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero3.yaml
     --dataset_name trl-internal-testing/descriptiveness-sentiment-trl-style \
     --dataset_train_split descriptiveness \
     --output_dir models/minimal/ppo \
-    --num_ppo_epochs 1 \
+    --num_epochs_per_batch_update 1 \
     --num_mini_batches 1 \
     --learning_rate 3e-6 \
     --per_device_train_batch_size 1 \
@@ -76,10 +76,14 @@ if __name__ == "__main__":
     if tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
     value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_config.trust_remote_code, num_labels=1
+        training_args.reward_model_path,
+        trust_remote_code=model_config.trust_remote_code,
+        num_labels=1,
     )
     reward_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_config.trust_remote_code, num_labels=1
+        training_args.reward_model_path,
+        trust_remote_code=model_config.trust_remote_code,
+        num_labels=1,
     )
     ref_policy = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_config.trust_remote_code
@@ -90,7 +94,9 @@ if __name__ == "__main__":
     ################
     # Dataset
     ################
-    dataset = load_dataset(script_args.dataset_name, split=script_args.dataset_train_split)
+    dataset = load_dataset(
+        script_args.dataset_name, split=script_args.dataset_train_split
+    )
     eval_samples = 100
     train_dataset = dataset.select(range(len(dataset) - eval_samples))
     eval_dataset = dataset.select(range(len(dataset) - eval_samples, len(dataset)))

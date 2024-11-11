@@ -215,7 +215,7 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
     --output_dir models/minimal/rloo_tldr \
     --dataset_name trl-internal-testing/tldr-preference-sft-trl-style \
     --dataset_test_split validation \
-    --num_ppo_epochs 2 \
+    --num_epochs_per_batch_update 2 \
     --num_mini_batches 2 \
     --learning_rate 3e-6 \
     --per_device_train_batch_size 8 \
