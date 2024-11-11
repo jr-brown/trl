@@ -125,6 +125,42 @@ class OnPolicyTrainer(ABC, Trainer):
         ),
         callbacks: Optional[List[TrainerCallback]] = None,
     ) -> None:
+        """
+        Base class for both PPO and KLQ.
+        This was pulled out by Lennie in early November 2024.
+        The only difference between PPO and KLQ is the `batch_update` method, and the
+        associated `stats` object.
+        The PPO code had flexibility for input parsing and terminology that was not immediately
+        obvious to us.
+        We therefore put some extended notes in this docstring.
+        
+
+        **Sketch of the PPO training algorithm:**
+
+        The algorithm consists of `config.num_total_batches` batch-update phases.
+        Each batch-update phase uses a `batch` of data from `self.dataloader`
+        (see construction of `self.dataloader` in this `__init__` call below)
+        and is defined by the `batch_update` method.
+        
+        Each batch-update proceeds via
+        1. Forward rollout
+        2. PPO training phase
+           Loops over the batch of data `config.num_epochs` times.
+           Within each epoch, the batch is divided into `config.num_mini_batches` mini-batches.
+           Each mini-batch is then further split into microbatches
+
+        There are many different 'number-of-sample'-like quantities in the code,
+        with certain algebraic relationships, but I do not yet have complete grasp on details.
+        These include:
+        - `config.num_total_batches`
+        - `config.local_batch_size`
+        - `config.mini_batch_size`
+        - `config.local_mini_batch_size`
+        - `config.num_mini_batches`
+        ...
+        Would be interesting to see if Claude can explain these efficiently.
+
+        """
 
         if ref_policy is policy:
             raise ValueError(
@@ -392,17 +428,6 @@ class OnPolicyTrainer(ABC, Trainer):
 
         self.accelerator.print("===training policy===")
         start_time = time.time()
-        # num_ppo_epochs is the number of epochs for which we train on each PPO dataset for each increment of PPO
-        # num_mini_batches
-        # gradient_accumulation_steps
-        stats_shape = (
-            config.num_ppo_epochs,
-            config.num_mini_batches,
-            config.gradient_accumulation_steps,
-        )
-
-        # Lightweight wrapper for a collection of tensors which track statistics over training
-        stats = self._initialise_stats(stats_shape, device)
 
         # Set model to training mode (relevant for e.g. batch norm and dropout)
         model.train()
@@ -442,6 +467,15 @@ class OnPolicyTrainer(ABC, Trainer):
         if self.is_deepspeed_enabled:
             self.deepspeed = self.model
             self.model_wrapped = self.model
+
+        # Initialising stats object
+        # (Lightweight wrapper for a collection of tensors which track statistics over training)
+        stats_shape = (
+            config.num_ppo_epochs,
+            config.num_mini_batches,
+            config.gradient_accumulation_steps,
+        )
+        stats = self._initialise_stats(stats_shape, self.accelerator.device)
 
         # The actual training loop
         for update in range(1, config.num_total_batches + 1):
