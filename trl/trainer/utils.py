@@ -1125,8 +1125,9 @@ def retokenize(
     if target_processing_class is None:
         return input_ids, source_processing_class.pad_token_id
     else:
+        decoded_batch = source_processing_class.batch_decode(input_ids, skip_special_tokens=True)
         new_inputs = target_processing_class(
-            source_processing_class.batch_decode(input_ids),
+            decoded_batch,
             return_tensors="pt",
             truncation=True,
             padding="max_length",
