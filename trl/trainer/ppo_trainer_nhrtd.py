@@ -445,7 +445,7 @@ def ppo_batch_update(
             (responses == processing_class.eos_token_id).sum().item()
         )
 
-    return model, metrics
+    return metrics
 
 
 class PPOTrainer(OnPolicyTrainer):
@@ -495,12 +495,12 @@ class PPOTrainer(OnPolicyTrainer):
             self.args.local_batch_size,
             self.args.local_mini_batch_size,
         )
-        return PPOStats(stats_shape, self.device)
+        return PPOStats(stats_shape, self.accelerator.device)
 
     def _batch_update(
         self,
         data: Dict[str, torch.Tensor],
-    ) -> Tuple[torch.nn.Module, Dict[str, float]]:
+    ) -> Dict[str, float]:
         return ppo_batch_update(
             # config-like and tokenizers
             config=self.args,

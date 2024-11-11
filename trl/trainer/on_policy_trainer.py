@@ -404,8 +404,9 @@ class OnPolicyTrainer(ABC, Trainer):
     def _batch_update(
         self,
         data: Dict[str, torch.Tensor],
-    ) -> Tuple[nn.Module, Dict[str, torch.Tensor]]:
-        """Returns the updated model and the metrics for the batch."""
+    ) -> Dict[str, torch.Tensor]:
+        """Returns metrics for the batch.
+        (Other updates are performed in place)."""
         pass
 
     def train(self):
@@ -424,7 +425,7 @@ class OnPolicyTrainer(ABC, Trainer):
         start_time = time.time()
 
         # Set model to training mode (relevant for e.g. batch norm and dropout)
-        model.train()
+        self.model.train()
 
         # trainer state initialization
         self.state.global_step = 0
@@ -469,7 +470,7 @@ class OnPolicyTrainer(ABC, Trainer):
 
             # Main training function
             # (see implementations in child classes)
-            model, metrics = self._batch_update(data=data)
+            metrics = self._batch_update(data=data)
 
             eps = int(self.state.episode / (time.time() - start_time))
             metrics["eps"] = eps
@@ -485,7 +486,7 @@ class OnPolicyTrainer(ABC, Trainer):
                 config, self.state, self.control
             )
             if self.control.should_save:
-                self._save_checkpoint(model, trial=None, metrics=metrics)
+                self._save_checkpoint(self.model, trial=None, metrics=metrics)
                 self.control = self.callback_handler.on_save(
                     config, self.state, self.control
                 )
@@ -504,7 +505,7 @@ class OnPolicyTrainer(ABC, Trainer):
             config, self.state, self.control
         )
         if self.control.should_save:
-            self._save_checkpoint(model, trial=None, metrics=None)
+            self._save_checkpoint(self.model, trial=None, metrics=None)
             self.control = self.callback_handler.on_save(
                 config, self.state, self.control
             )

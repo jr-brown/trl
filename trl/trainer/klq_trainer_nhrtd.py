@@ -606,6 +606,8 @@ def klq_batch_update(
         metrics["loss/avg_target_values"] = returns.mean().item()
         metrics["loss/var_target_values"] = returns.var().item()
 
+    return metrics
+
 
 class KLQTrainer(OnPolicyTrainer):
     _tag_names = ["trl", "klq"]
@@ -654,12 +656,12 @@ class KLQTrainer(OnPolicyTrainer):
             self.args.local_batch_size,
             self.args.local_mini_batch_size,
         )
-        return KLQStats(stats_shape, self.device)
+        return KLQStats(stats_shape, self.accelerator.device)
 
     def _batch_update(
         self,
         data: Dict[str, torch.Tensor],
-    ) -> Tuple[torch.nn.Module, Dict[str, float]]:
+    ) -> Dict[str, float]:
         return klq_batch_update(
             # config-like and tokenizers
             config=self.args,
