@@ -366,9 +366,9 @@ class KLQTrainer(Trainer):
         if config.whiten_rewards:
             assert (
                 config.local_mini_batch_size >= 8
-            ), f"Per-rank minibatch size {config.local_mini_batch_size} is insufficient for whitening"
-        # `per_rank_rollout_batch_size` is our `args.local_batch_size`
-        # `per_rank_minibatch_size` is our `args.local_mini_batch_size`
+            ), f"Per-device minibatch size {config.local_mini_batch_size} is insufficient for whitening"
+        # `per_device_rollout_batch_size` is our `args.local_batch_size`
+        # `per_device_minibatch_size` is our `args.local_mini_batch_size`
         config.num_total_batches = math.ceil(
             config.total_episodes / config.batch_size
         )  # we may train for more than `total_episodes`
@@ -535,6 +535,7 @@ class KLQTrainer(Trainer):
             top_k=0.0,
             top_p=1.0,
             do_sample=True,
+            stop_strings=config.stop_strings,
         )
 
         accelerator.print("===training policy===")
@@ -1165,10 +1166,11 @@ class KLQTrainer(Trainer):
         reward_model_processing_class = self.reward_model_processing_class
         generation_config = GenerationConfig(
             max_new_tokens=self.args.response_length,
-            temperature=(0.01 + 1e-7),
+            temperature=self.args.eval_temperature,
             top_k=0.0,
             top_p=1.0,
             do_sample=True,
+            stop_strings=self.args.stop_strings,
         )
 
         table = defaultdict(list)
