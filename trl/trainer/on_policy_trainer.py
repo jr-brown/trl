@@ -134,34 +134,34 @@ class OnPolicyTrainer(ABC, Trainer):
             local - The prefix `local' refers specifically to being local to one *process*.
                     When the `world size' is equal to 1 then the `local' prefix means nothing.
                     In general, if there is both a local and non-local version of a variable, then the non-local version is not used for anything.
-                    In other words, the local versions are the ones that actually turn up later in the code. 
-                    
+                    In other words, the local versions are the ones that actually turn up later in the code.
+
         NOTES:
-            I think it's possible that there's a mistake in the code, but I don't understand how accelerator works well enough to be sure. 
+            I think it's possible that there's a mistake in the code, but I don't understand how accelerator works well enough to be sure.
             Basically, I'm confident that local_mini_batch_size is meant to be the number of rollouts that contribute to a single policy update.
             However, when accelerator is called, the number of gradient accumulation steps is set to config.gradient_accumulation_steps.
-            Otherwise the naming convention seems quite strange. 
+            Otherwise the naming convention seems quite strange.
 
         - `config.world_size`
-            * The number of processes we're using. 
+            * The number of processes we're using.
             * This is *primative*, in the sense that it is not derived from other quantities.
             * This is not set by us. Rather, it is set by setting it directly to accelerator.num_processes
 
         - `config.total_episodes`
-            * The total number of rollouts to do in the entire training loop, across all batches. 
+            * The total number of rollouts to do in the entire training loop, across all batches.
             * This is a *primative* quantity
 
         - `config.per_device_train_batch_size`
             * This tells us, for each device, how many samples to simultaneously process at each training step.
-            * This is equivalent to the size of a `micro-batch' 
+            * This is equivalent to the size of a `micro-batch'
             * This is a *primative* quantity
 
         - `config.num_mini_batches`
-            * This is the number of policy parameter update steps performed during each iteration of the outer loop. 
+            * This is the number of policy parameter update steps performed during each iteration of the outer loop.
             * This is a *primative* quantity
-            * This is used to divide the local_batch_size and batch_size to get the local_mini_batch_size and mini_batch_size respectively. 
-            * It doesn't come into the code in any way other than dividing the above quantities. 
-        
+            * This is used to divide the local_batch_size and batch_size to get the local_mini_batch_size and mini_batch_size respectively.
+            * It doesn't come into the code in any way other than dividing the above quantities.
+
         - `config.gradient_accumulation_steps`
             * This is the number of mini-batches to accumulate gradients over before updating the model.
             * This is a *primative* quantity
@@ -170,13 +170,13 @@ class OnPolicyTrainer(ABC, Trainer):
         - `config.local_batch_size`
             * This is the number of rollouts for each process at every outer loop of the algorithm.
             * Each local batch is then divided into local mini-batches.
-            * This is a *derived* quantitiy given by the product of 
+            * This is a *derived* quantitiy given by the product of
                 1. `config.num_mini_batches`
                 2. `config.gradient_accumulation_steps`
                 3. `config.per_device_train_batch_size`
 
         - `config.batch_size`
-            * This is the number of rollouts across all devices and processes at every outer loop of the algorithm. 
+            * This is the number of rollouts across all devices and processes at every outer loop of the algorithm.
             * This is a *derived* quantity given by the product of
                 1. `config.local_batch_size`
                 2. `config.world_size`
@@ -184,23 +184,23 @@ class OnPolicyTrainer(ABC, Trainer):
 
         - `config.local_mini_batch_size`
             * This is is the number of rollouts within a mini-batch on each individual process (a local mini-batch).
-            * A mini-batch is the collection of rollouts that are used to compute one update to the policy parameters. 
+            * A mini-batch is the collection of rollouts that are used to compute one update to the policy parameters.
             * Each mini-batch is then divided into a micro-batch, with each micro-batch being processed on a single device.
             * This is a *derived* quantity given by:
                 local_batch_size / num_mini_batches
             * This is equivalent to:
                 gradient_accumulation_steps * per_device_train_batch_size
-                
+
         -  `config.mini_batch_size`
             * This is a *derived* quantity given by:
                 batch_size / num_mini_batches
             * This is equivalent to:
                 local_mini_batch_size * world_size
-            * This is not used for anything. 
+            * This is not used for anything.
 
         - `config.num_total_batches`
-            * This is the number of outer iteration loops for the algorithm. 
-            * In other words, the number of times we alternate between doing rollouts and performing policy updates. 
+            * This is the number of outer iteration loops for the algorithm.
+            * In other words, the number of times we alternate between doing rollouts and performing policy updates.
             * This is a *derived* quantity given by:
                 total_episodes / batch_size
 
