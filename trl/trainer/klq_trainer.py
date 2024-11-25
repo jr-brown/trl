@@ -419,14 +419,7 @@ def klq_batch_update(
     with torch.no_grad():
         queries = data["input_ids"].to(device)
         context_length = queries.shape[1]
-        responses = []
-        postprocessed_responses = []
-        logprobs = []
-        ref_logprobs = []
-        scores = []
-        sequence_lengths = []
-        state_values = []
-        action_values = []
+        
         with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
             # query_respones and logitss are both torch Tensors.
             # query_responses has shape [batch, query_length]
