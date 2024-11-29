@@ -13,60 +13,32 @@
 # limitations under the License.
 
 import gc
-import math
-import os
-import textwrap
-import time
-from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union, Callable
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from torch import Tensor  # for type hinting
-from accelerate import Accelerator
-from accelerate.utils import broadcast, gather_object
+from dataclasses import dataclass
+
 from datasets import Dataset
-from torch.utils.data import DataLoader
 from transformers import (
     DataCollatorWithPadding,
-    GenerationConfig,
     PreTrainedTokenizerBase,
-    Trainer,
     TrainerCallback,
-    TrainerControl,
-    is_wandb_available,
-)
-from transformers.integrations import get_reporting_integration_callbacks
-from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
-from transformers.trainer_callback import (
-    CallbackHandler,
-    ExportableState,
-    PrinterCallback,
 )
 
 from ..core import masked_mean, masked_whiten
 from ..models.utils import unwrap_model_for_generation
 from ..trainer.utils import (
-    OnlineTrainerState,
     batch_generation,
-    disable_dropout_in_model,
-    exact_div,
     forward,
-    retokenize,
-    prepare_deepspeed,
-    print_rich_table,
-    truncate_response,
 )
 from .klq_config import KLQConfig
-from .utils import generate_model_card
-from .on_policy_utils import get_just_reward, forward_rollout
+from .on_policy_utils import forward_rollout
 from .on_policy_trainer import OnPolicyTrainer
-
-if is_wandb_available():
-    import wandb
 
 
 ProcessingClass = PreTrainedTokenizerBase
@@ -75,31 +47,31 @@ ProcessingClass = PreTrainedTokenizerBase
 INVALID_LOGPROB = 1.0
 
 
+@dataclass
+class LossFunctionTensors:
+    action_value_prediction: torch.Tensor
+    state_value_prediction: torch.Tensor
+    new_ref_log_ratio: torch.Tensor
+    micro_batch_prev_state_values: torch.Tensor
+    prev_ref_log_ratio: torch.Tensor
+    micro_batch_return: torch.Tensor
+
+
 def l2_loss(
     config,
-    action_value_prediction,
-    state_value_prediction,
-    new_ref_log_ratio,
-    micro_batch_prev_state_values,
-    prev_ref_log_ratio,
-    micro_batch_return,
+    tensors: LossFunctionTensors,
 ):
-    return torch.square(action_value_prediction - micro_batch_return)
+    return torch.square(tensors.action_value_prediction - tensors.micro_batch_return)
 
 
 def huber_loss(
     config,
-    action_value_prediction,
-    state_value_prediction,
-    new_ref_log_ratio,
-    micro_batch_prev_state_values,
-    prev_ref_log_ratio,
-    micro_batch_return,
+    tensors: LossFunctionTensors,
 ):
     huber_cutoff = config.loss_kwargs["huber_cutoff"]
     return F.huber_loss(
-        action_value_prediction,
-        micro_batch_return,
+        tensors.action_value_prediction,
+        tensors.micro_batch_return,
         reduction="none",
         delta=huber_cutoff,
     )
@@ -107,31 +79,26 @@ def huber_loss(
 
 def value_clipped_loss(
     config,
-    action_value_prediction,
-    state_value_prediction,
-    new_ref_log_ratio,
-    micro_batch_prev_state_values,
-    prev_ref_log_ratio,
-    micro_batch_return,
+    tensors: LossFunctionTensors,
 ):
     # Unload arguments
     kl_coef = config.kl_coef
     action_value_clip_bound = config.loss_kwargs["action_value_clip_bound"]
 
     # Compute the standard l2 loss
-    unclipped_value_loss = torch.square(action_value_prediction - micro_batch_return)
+    unclipped_value_loss = torch.square(tensors.action_value_prediction - tensors.micro_batch_return)
 
     # Compute the clipped loss
     prev_action_value_prediction = (
-        kl_coef * (prev_ref_log_ratio) + micro_batch_prev_state_values
+        kl_coef * (tensors.prev_ref_log_ratio) + tensors.micro_batch_prev_state_values
     )
     clipped_aciton_value_prediction = torch.clamp(
-        action_value_prediction,
+        tensors.action_value_prediction,
         prev_action_value_prediction - action_value_clip_bound,
         prev_action_value_prediction + action_value_clip_bound,
     )
     clipped_value_loss = torch.square(
-        clipped_aciton_value_prediction - micro_batch_return
+        clipped_aciton_value_prediction - tensors.micro_batch_return
     )
 
     # Return the maximum of the two losses
@@ -140,31 +107,26 @@ def value_clipped_loss(
 
 def ratio_clipped_loss(
     config,
-    action_value_prediction,
-    state_value_prediction,
-    new_ref_log_ratio,
-    micro_batch_prev_state_values,
-    prev_ref_log_ratio,
-    micro_batch_return,
+    tensors: LossFunctionTensors,
 ):
     # Unload arguments
     kl_coef = config.kl_coef
     log_ratio_clip_bound = config.loss_kwargs["log_ratio_clip_bound"]
 
     # Compute the standard l2 loss
-    unclipped_value_loss = torch.square(action_value_prediction - micro_batch_return)
+    unclipped_value_loss = torch.square(tensors.action_value_prediction - tensors.micro_batch_return)
 
     # Compute the clipped loss
     clipped_log_ratio = torch.clamp(
-        new_ref_log_ratio,
-        prev_ref_log_ratio - log_ratio_clip_bound,
-        prev_ref_log_ratio + log_ratio_clip_bound,
+        tensors.new_ref_log_ratio,
+        tensors.prev_ref_log_ratio - log_ratio_clip_bound,
+        tensors.prev_ref_log_ratio + log_ratio_clip_bound,
     )
     clipped_action_value_prediction = (
-        kl_coef * (clipped_log_ratio) + state_value_prediction
+        kl_coef * (clipped_log_ratio) + tensors.state_value_prediction
     )
     clipped_value_loss = torch.square(
-        clipped_action_value_prediction - micro_batch_return
+        clipped_action_value_prediction - tensors.micro_batch_return
     )
 
     # Return the maximum of the two losses
@@ -173,12 +135,7 @@ def ratio_clipped_loss(
 
 def double_clipped_loss(
     config,
-    action_value_prediction,
-    state_value_prediction,
-    new_ref_log_ratio,
-    micro_batch_prev_state_values,
-    prev_ref_log_ratio,
-    micro_batch_return,
+    tensors: LossFunctionTensors,
 ):
     # unload arguments
     kl_coef = config.kl_coef
@@ -186,32 +143,32 @@ def double_clipped_loss(
     log_ratio_clip_bound = config.loss_kwargs["log_ratio_clip_bound"]
 
     # Compute the standard l2 loss
-    unclipped_value_loss = torch.square(action_value_prediction - micro_batch_return)
+    unclipped_value_loss = torch.square(tensors.action_value_prediction - tensors.micro_batch_return)
 
     # Compute the action-value clipped loss
     prev_action_value_prediction = (
-        kl_coef * (prev_ref_log_ratio) + micro_batch_prev_state_values
+        kl_coef * (tensors.prev_ref_log_ratio) + tensors.micro_batch_prev_state_values
     )
     action_value_clipped_aciton_value_prediction = torch.clamp(
-        action_value_prediction,
+        tensors.action_value_prediction,
         prev_action_value_prediction - action_value_clip_bound,
         prev_action_value_prediction + action_value_clip_bound,
     )
     action_value_clipped_value_loss = torch.square(
-        action_value_clipped_aciton_value_prediction - micro_batch_return
+        action_value_clipped_aciton_value_prediction - tensors.micro_batch_return
     )
 
     # Compute the log-ratio clipped loss
     clipped_log_ratio = torch.clamp(
-        new_ref_log_ratio,
-        prev_ref_log_ratio - log_ratio_clip_bound,
-        prev_ref_log_ratio + log_ratio_clip_bound,
+        tensors.new_ref_log_ratio,
+        tensors.prev_ref_log_ratio - log_ratio_clip_bound,
+        tensors.prev_ref_log_ratio + log_ratio_clip_bound,
     )
     log_ratio_clipped_action_value_prediction = (
-        kl_coef * (clipped_log_ratio) + state_value_prediction
+        kl_coef * (clipped_log_ratio) + tensors.state_value_prediction
     )
     log_ratio_clipped_value_loss = torch.square(
-        log_ratio_clipped_action_value_prediction - micro_batch_return
+        log_ratio_clipped_action_value_prediction - tensors.micro_batch_return
     )
 
     # Return the maximum of the three losses
@@ -227,13 +184,8 @@ loss_function_map: dict[
     Callable[
         [
             KLQConfig,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
+            LossFunctionTensors,
         ],
-        torch.Tensor,
     ],
 ] = {
     "l2_loss": l2_loss,
@@ -351,12 +303,14 @@ def micro_batch_updates(
             # Compute loss
             action_value_function_losses = loss_function_map[config.loss_function](
                 config,
-                action_value_prediction,
-                state_value_prediction,
-                new_ref_log_ratio,
-                micro_batch_prev_state_values,
-                prev_ref_log_ratio,
-                micro_batch_return,
+                LossFunctionTensors(
+                    action_value_prediction,
+                    state_value_prediction,
+                    new_ref_log_ratio,
+                    micro_batch_prev_state_values,
+                    prev_ref_log_ratio,
+                    micro_batch_return,
+                )
             )
             action_value_function_loss = masked_mean(
                 action_value_function_losses, ~padding_mask_plus_one[micro_batch_inds]
@@ -419,7 +373,7 @@ def klq_batch_update(
     with torch.no_grad():
         queries = data["input_ids"].to(device)
         context_length = queries.shape[1]
-        
+
         with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
             # query_respones and logitss are both torch Tensors.
             # query_responses has shape [batch, query_length]

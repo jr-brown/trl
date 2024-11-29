@@ -21,11 +21,9 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 from abc import ABC, abstractmethod
 
-import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import broadcast, gather_object
 from datasets import Dataset
@@ -47,22 +45,19 @@ from transformers.trainer_callback import (
     PrinterCallback,
 )
 
-from ..core import masked_mean, masked_whiten
 from ..models.utils import unwrap_model_for_generation
 from ..trainer.utils import (
     OnlineTrainerState,
     batch_generation,
     disable_dropout_in_model,
     exact_div,
-    forward,
     retokenize,
     prepare_deepspeed,
     print_rich_table,
     truncate_response,
 )
-from .ppo_config import PPOConfig
 from .utils import generate_model_card
-from .on_policy_utils import get_just_reward, forward_rollout
+from .on_policy_utils import get_just_reward
 from ..trainer.utils import OnPolicyConfig
 
 if is_wandb_available():
