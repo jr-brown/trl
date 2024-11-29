@@ -186,6 +186,7 @@ loss_function_map: dict[
             KLQConfig,
             LossFunctionTensors,
         ],
+        torch.Tensor
     ],
 ] = {
     "l2_loss": l2_loss,
