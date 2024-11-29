@@ -567,7 +567,7 @@ class OnPolicyTrainer(ABC, Trainer):
                 config.num_sample_generations > 0
                 and (update - 1) % self.sample_generations_freq == 0
             ):
-                self.generate_completions(sampling=True)
+                self.generate_eval_completions(sampling=True)
                 torch.cuda.empty_cache()
 
         # HF trainer specifics
@@ -580,7 +580,13 @@ class OnPolicyTrainer(ABC, Trainer):
                 config, self.state, self.control
             )
 
-    def generate_completions(self, sampling: bool = False):
+    def generate_eval_completions(self, sampling: bool = False):
+        """
+        Generate completions for the eval dataset and log the completions and their scores.
+
+        Args:
+            sampling (bool): When sampling is True, only a single batch of completions is generated. Otherwise, all completions are generated for the entire eval dataset.
+        """
         config = self.args
         processing_class = self.processing_class
         reward_model_processing_class = self.reward_model_processing_class

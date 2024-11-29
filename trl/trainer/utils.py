@@ -988,7 +988,7 @@ class OnPolicyConfig(TrainingArguments):
         local_rollout_forward_batch_size (`int`, *optional*, defaults to `64`):
             Per rank no grad forward pass in the rollout phase.
         num_sample_generations (`int`, *optional*, defaults to `10`):
-            Number of debugging samples generations (i.e., `generate_completions` calls) throughout training.
+            Number of debugging samples generations (i.e., `generate_eval_completions` calls) throughout training.
         response_length (`int`, *optional*, defaults to `53`):
             Length of the response.
         stop_token (`Optional[str]`, *optional*, defaults to `None`):
