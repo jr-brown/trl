@@ -41,8 +41,19 @@ def get_just_value(
 
 
 def get_just_reward(
-    model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int, context_length: int
+    model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int, query_length: int
 ) -> torch.Tensor:
+    """
+    3LM wrapper function for getting the reward from a model.
+    Passes query response pairs into the reward model and extracts the rewards for the responses.
+
+    Args:
+        model: The reward model.
+        query_responses: The responses to get the reward for.
+
+    Returns:
+
+    """
     attention_mask = query_responses != pad_token_id
     lm_backbone = getattr(model, model.base_model_prefix)
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
@@ -67,19 +78,19 @@ def get_just_reward(
             output_hidden_states=True,
         )
 
-    reward_logits = model.score(output.hidden_states[-1]).squeeze(-1)
+    full_rewards = model.score(output.hidden_states[-1]).squeeze(-1)
 
     # Check if we've produced reward for whole sequence, or value for each token
-    if len(reward_logits.shape) == 1:
-        return reward_logits
+    if len(full_rewards.shape) == 1:
+        return full_rewards
 
     # In latter case we need to get the final value of the sequence
     else:
         last_non_pad_tkn_idxs = first_true_indices(
-            query_responses[:, context_length:] == pad_token_id
-        ) - 1 + context_length
-        return reward_logits[
-            torch.arange(reward_logits.size(0), device=reward_logits.device),
+            query_responses[:, query_length:] == pad_token_id
+        ) - 1 + query_length
+        return full_rewards[
+            torch.arange(full_rewards.size(0), device=full_rewards.device),
             last_non_pad_tkn_idxs,
         ]
 
