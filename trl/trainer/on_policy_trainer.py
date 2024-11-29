@@ -480,7 +480,11 @@ class OnPolicyTrainer(ABC, Trainer):
         pass
 
     def train(self):
-        """Train the policy (model) and"""
+        """Train the model (wrapper around combination of policy and value LLMs).
+        This consists of config.num_total_batches calls of the `_batch_update` method 
+        (which should be implemented for each subclass).
+        Each batch update consists of a single forward rollout on a batch of queries
+        and then multiple epochs of training with this batch of data. """
         config = self.args
         dataloader = self.dataloader
         assert self.processing_class is not None
