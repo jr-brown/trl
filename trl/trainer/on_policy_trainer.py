@@ -435,6 +435,14 @@ class OnPolicyTrainer(ABC, Trainer):
             do_sample=True,
         )
 
+        self.eval_generation_config = GenerationConfig(
+            max_new_tokens=config.response_length,
+            temperature=(config.eval_temperature + 1e-7),
+            top_k=0.0,
+            top_p=1.0,
+            do_sample=True,
+        )
+
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
 
@@ -576,13 +584,6 @@ class OnPolicyTrainer(ABC, Trainer):
         config = self.args
         processing_class = self.processing_class
         reward_model_processing_class = self.reward_model_processing_class
-        generation_config = GenerationConfig(
-            max_new_tokens=config.response_length,
-            temperature=(0.01 + 1e-7),
-            top_k=0.0,
-            top_p=1.0,
-            do_sample=True,
-        )
 
         table = defaultdict(list)
         with unwrap_model_for_generation(
@@ -597,7 +598,7 @@ class OnPolicyTrainer(ABC, Trainer):
                         query,
                         query.shape[0],
                         processing_class.pad_token_id,
-                        generation_config,
+                        self.eval_generation_config,
                     )
                     response = query_response[:, context_length:]
                     postprocessed_response = response

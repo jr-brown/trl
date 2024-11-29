@@ -37,7 +37,7 @@ from ..trainer.utils import (
     forward,
 )
 from .klq_config import KLQConfig
-from .on_policy_utils import forward_rollout
+from .on_policy_utils import rollouts_to_loss_variables
 from .on_policy_trainer import OnPolicyTrainer
 
 
@@ -393,7 +393,7 @@ def klq_batch_update(
             sequence_lengths,
             scores,
             state_values,
-        ) = forward_rollout(
+        ) = rollouts_to_loss_variables(
             queries=queries,
             query_responses=query_responses,
             logitss=logitss,
@@ -403,10 +403,9 @@ def klq_batch_update(
             processing_class=processing_class,
             reward_model_processing_class=reward_model_processing_class,
             context_length=context_length,
-            pad_token_id=processing_class.pad_token_id,
             stop_token_id=config.stop_token_id,
             local_rollout_forward_batch_size=config.local_rollout_forward_batch_size,
-            temperature=config.temperature,
+            ref_temperature=config.ref_temperature,
             device=device,
         )
         action_values = config.kl_coef * (logprobs - ref_logprobs) + state_values
