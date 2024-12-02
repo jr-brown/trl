@@ -657,7 +657,6 @@ class OnPolicyTrainer(ABC, Trainer):
                         self.reward_model,
                         reward_model_inputs,
                         reward_model_pad_token,
-                        context_length,
                     )
                     table["score"].extend(
                         self.accelerator.gather(score).float().cpu().numpy()

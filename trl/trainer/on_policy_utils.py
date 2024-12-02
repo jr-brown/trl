@@ -42,7 +42,7 @@ def get_just_value(
 
 
 def get_just_reward(
-    model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int, query_length: int
+    model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int
 ) -> torch.Tensor:
     """
     3LM wrapper function for getting the reward from a model.
@@ -87,9 +87,10 @@ def get_just_reward(
 
     # In latter case we need to get the final value of the sequence
     else:
-        last_non_pad_tkn_idxs = first_true_indices(
-            query_responses[:, query_length:] == pad_token_id
-        ) - 1 + query_length
+        # Will error if query_responses is entirely pad tokens as last_non_pad_tkn_idxs will be -1
+        last_non_pad_tkn_idxs = query_responses.size(-1) - first_true_indices(
+            torch.flip(query_responses, dims=(-1,)) == pad_token_id
+        ) - 1
         return full_rewards[
             torch.arange(full_rewards.size(0), device=full_rewards.device),
             last_non_pad_tkn_idxs,
@@ -145,7 +146,7 @@ def rollouts_to_loss_variables(
     device,
 ):
     """
-    Takes in an iteration batch of queries and responses, and computes various variables needed for defining the loss function. 
+    Takes in an iteration batch of queries and responses, and computes various variables needed for defining the loss function.
 
     Args:
         queries (torch.Tensor): The queries to the model.
@@ -215,11 +216,11 @@ def rollouts_to_loss_variables(
 
         if (
             response_truncation_sequences is not None
-        ):  
+        ):
             postprocessed_response = truncate_response_from_sequences(
                 response_truncation_sequences, pad_token_id, response
             )
-            
+
         # Response Processing 2. run reward model on the truncated responses
 
         # FLAG - This feels inefficient for when the action-value function is a head on the model doing the generation
@@ -256,7 +257,6 @@ def rollouts_to_loss_variables(
             reward_model,
             reward_model_inputs,
             reward_model_pad_token,
-            context_length,
         )
 
         # This is just a bunch of logging stuff
