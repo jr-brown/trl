@@ -52,6 +52,7 @@ _import_structure = {
     "nash_md_trainer": ["NashMDTrainer"],
     "online_dpo_config": ["OnlineDPOConfig"],
     "online_dpo_trainer": ["OnlineDPOTrainer"],
+    "on_policy_trainer": ["OnPolicyTrainer"],
     "orpo_config": ["ORPOConfig"],
     "orpo_trainer": ["ORPOTrainer"],
     "ppo_config": ["PPOConfig"],
@@ -69,6 +70,7 @@ _import_structure = {
         "ConstantLengthDataset",
         "DataCollatorForCompletionOnlyLM",
         "FixedKLController",
+        "OnPolicyConfig",
         "RunningMoments",
         "disable_dropout_in_model",
         "peft_module_casting_to_bf16",
@@ -116,6 +118,7 @@ if TYPE_CHECKING:
     from .nash_md_trainer import NashMDTrainer
     from .online_dpo_config import OnlineDPOConfig
     from .online_dpo_trainer import OnlineDPOTrainer
+    from .on_policy_trainer import OnPolicyTrainer
     from .orpo_config import ORPOConfig
     from .orpo_trainer import ORPOTrainer
     from .ppo_config import PPOConfig
@@ -135,6 +138,7 @@ if TYPE_CHECKING:
         ConstantLengthDataset,
         DataCollatorForCompletionOnlyLM,
         FixedKLController,
+        OnPolicyConfig,
         RunningMoments,
         disable_dropout_in_model,
         empty_cache,
