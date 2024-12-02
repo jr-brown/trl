@@ -995,7 +995,7 @@ class OnPolicyConfig(TrainingArguments):
             Stop token.
         stop_token_id (`Optional[int]`, *optional*, defaults to `None`):
             Truncation token id.
-        stop_strings (`Optional[Union[List[str],str]]`, *optional*, defaults to `None`):
+        response_truncation_sequences (`[List[List[int]]]`, *optional*, defaults to `None`):
             Stop strings for generations from the model. 
         temperature (`float`, *optional*, defaults to `0.7`):
             Sampling temperature.
@@ -1034,7 +1034,7 @@ class OnPolicyConfig(TrainingArguments):
     response_length: int = 53
     stop_token: Optional[Literal["eos"]] = None
     stop_token_id: Optional[int] = None
-    stop_strings: Optional[Union[List[str], str]] = None
+    response_truncation_sequences: Optional[List[List[int]]] = None
     temperature: float = 1.0
     eval_temperature: float = 1.0
     ref_temperature: float = 1.0
@@ -1251,6 +1251,51 @@ def truncate_response(stop_token_id: int, pad_token_id: int, responses: torch.Te
     postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, pad_token_id)
     return postprocessed_responses
 
+def truncate_response_from_sequences(response_truncation_sequences: list[list[int]], pad_token_id: int, responses: torch.Tensor):
+    """
+    Truncates the responses at the first occurrence of any of the stop sequences, filling the rest (including the stop sequence)
+    with pad tokens.
+    
+    Args:
+        response_truncation_sequences (list[list[int]]):
+            List of token ID sequences that should trigger truncation. Each sequence should be a list of token IDs
+            that need to appear consecutively.
+        pad_token_id (int):
+            The token ID representing the pad token used to fill the truncated responses.
+        responses (torch.Tensor):
+            The tensor containing the responses to be truncated. Shape: (batch_size, sequence_length)
+            
+    Returns:
+        torch.Tensor:
+            The truncated responses tensor with pad tokens filled after any stop sequence.
+    """
+    batch_size, seq_length = responses.size()
+    trunc_indices = torch.full((batch_size,), seq_length, device=responses.device)
+    
+    # For each stop sequence
+    for stop_seq in response_truncation_sequences:
+        stop_seq_length = len(stop_seq)
+        stop_tensor = torch.tensor(stop_seq, device=responses.device)
+        
+        # For each possible starting position in the sequence
+        for start_idx in range(seq_length - stop_seq_length + 1):
+            # Extract sequence window
+            window = responses[:, start_idx:start_idx + stop_seq_length]
+            # Check if window matches stop sequence
+            matches = (window == stop_tensor).all(dim=1)
+            # Update truncation indices where matches found
+            trunc_indices = torch.minimum(
+                trunc_indices,
+                torch.where(matches, start_idx, seq_length)
+            )
+    
+    # Create index tensor for masking
+    idxs = torch.arange(seq_length, device=responses.device).expand(batch_size, -1)
+    # Create mask and apply padding - now including the stop sequence itself
+    mask = idxs >= trunc_indices.unsqueeze(1)
+    postprocessed_responses = torch.where(mask, pad_token_id, responses)
+    
+    return postprocessed_responses
 
 def generate(
     lm_backbone: torch.nn.Module, queries: torch.Tensor, pad_token_id: int, generation_config: GenerationConfig
