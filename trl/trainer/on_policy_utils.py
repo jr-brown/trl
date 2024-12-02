@@ -7,6 +7,7 @@ from ..trainer.utils import (
     forward,
     retokenize,
     truncate_response,
+    truncate_response_from_sequences,
 )
 
 
@@ -138,6 +139,7 @@ def rollouts_to_loss_variables(
     reward_model_processing_class,
     context_length,
     stop_token_id,
+    response_truncation_sequences: list[list[int]],
     local_rollout_forward_batch_size,
     ref_temperature,
     device,
@@ -156,6 +158,7 @@ def rollouts_to_loss_variables(
         reward_model_processing_class (AutoTokenizer): The tokenizer class for the reward model.
         context_length (int): The length of the context.
         stop_token_id (Optional[int]): The stop_token_id.
+        response_truncation_sequences (list[list[int]]): Token id sequences at which to truncate the responses (inclusive).
         local_rollout_forward_batch_size (int): The number of rollouts to process simultaneously 
         ref_temperature (float): The ref_temperature to use for the reference model.
         device (torch.device): The device to run the model on.
@@ -201,7 +204,7 @@ def rollouts_to_loss_variables(
         )
         torch.cuda.empty_cache()
 
-        # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
+        # Response Processing 1. truncate response after the first occurrence of `stop_token_id` and before the occurance of any token sequence in `response_truncation_sequences`
         postprocessed_response = response
         if (
             stop_token_id is not None
@@ -210,6 +213,13 @@ def rollouts_to_loss_variables(
                 stop_token_id, pad_token_id, response
             )
 
+        if (
+            response_truncation_sequences is not None
+        ):  
+            postprocessed_response = truncate_response_from_sequences(
+                response_truncation_sequences, pad_token_id, response
+            )
+            
         # Response Processing 2. run reward model on the truncated responses
 
         # FLAG - This feels inefficient for when the action-value function is a head on the model doing the generation

@@ -405,6 +405,7 @@ def klq_batch_update(
             reward_model_processing_class=reward_model_processing_class,
             context_length=context_length,
             stop_token_id=config.stop_token_id,
+            response_truncation_sequences=config.response_truncation_sequences,
             local_rollout_forward_batch_size=config.local_rollout_forward_batch_size,
             ref_temperature=config.ref_temperature,
             device=device,

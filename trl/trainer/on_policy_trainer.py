@@ -55,6 +55,7 @@ from ..trainer.utils import (
     prepare_deepspeed,
     print_rich_table,
     truncate_response,
+    truncate_response_from_sequences,
 )
 from .utils import generate_model_card
 from .on_policy_utils import get_just_reward
@@ -620,6 +621,16 @@ class OnPolicyTrainer(ABC, Trainer):
                             processing_class.pad_token_id,
                             response,
                         )
+
+                    if (
+                        config.response_truncation_sequences is not None
+                    ):  
+                        postprocessed_response = truncate_response_from_sequences(
+                            config.response_truncation_sequences, 
+                            processing_class.pad_token_id, 
+                            response
+                        )
+
                     table["query"].extend(
                         gather_object(
                             processing_class.batch_decode(
