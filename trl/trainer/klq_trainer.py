@@ -86,7 +86,9 @@ def value_clipped_loss(
     action_value_clip_bound = config.loss_kwargs["action_value_clip_bound"]
 
     # Compute the standard l2 loss
-    unclipped_value_loss = torch.square(tensors.action_value_prediction - tensors.micro_batch_return)
+    unclipped_value_loss = torch.square(
+        tensors.action_value_prediction - tensors.micro_batch_return
+    )
 
     # Compute the clipped loss
     prev_action_value_prediction = (
@@ -114,7 +116,9 @@ def ratio_clipped_loss(
     log_ratio_clip_bound = config.loss_kwargs["log_ratio_clip_bound"]
 
     # Compute the standard l2 loss
-    unclipped_value_loss = torch.square(tensors.action_value_prediction - tensors.micro_batch_return)
+    unclipped_value_loss = torch.square(
+        tensors.action_value_prediction - tensors.micro_batch_return
+    )
 
     # Compute the clipped loss
     clipped_log_ratio = torch.clamp(
@@ -143,7 +147,9 @@ def double_clipped_loss(
     log_ratio_clip_bound = config.loss_kwargs["log_ratio_clip_bound"]
 
     # Compute the standard l2 loss
-    unclipped_value_loss = torch.square(tensors.action_value_prediction - tensors.micro_batch_return)
+    unclipped_value_loss = torch.square(
+        tensors.action_value_prediction - tensors.micro_batch_return
+    )
 
     # Compute the action-value clipped loss
     prev_action_value_prediction = (
@@ -186,7 +192,7 @@ loss_function_map: dict[
             KLQConfig,
             LossFunctionTensors,
         ],
-        torch.Tensor
+        torch.Tensor,
     ],
 ] = {
     "l2_loss": l2_loss,
@@ -311,7 +317,7 @@ def micro_batch_updates(
                     micro_batch_prev_state_values,
                     prev_ref_log_ratio,
                     micro_batch_return,
-                )
+                ),
             )
             action_value_function_loss = masked_mean(
                 action_value_function_losses, ~padding_mask_plus_one[micro_batch_inds]
@@ -473,7 +479,7 @@ def klq_batch_update(
         # Create the advantage estimates by reversing the GAE backward recursion
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         # Set the return estimates to be the advantage estimates
-        returns = advantages + state_values
+        returns = advantages + action_values  # This used to be state_values
         returns = torch.masked_fill(returns, padding_mask_plus_one, 0)  # BUGHOTSPOT
 
         # Whiten the advantages. Note that this is *non-optional* and *done at the entire batch level*
