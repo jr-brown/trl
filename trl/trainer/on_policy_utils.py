@@ -21,7 +21,9 @@ def get_just_value(
     # Wrapping to allow for models which don't use position_ids, e.g. DistilBert
     # These models also don't have the use_cache kwarg
     if not hasattr(model, "use_position_ids") or model.use_position_ids:
-        position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
+        position_ids = (
+            attention_mask.cumsum(1) - attention_mask.long()
+        )  # exclusive cumsum
         output = lm_backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -62,7 +64,9 @@ def get_just_reward(
     # Wrapping to allow for models which don't use position_ids, e.g. DistilBert
     # These models also don't have the use_cache kwarg
     if not hasattr(model, "use_position_ids") or model.use_position_ids:
-        position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
+        position_ids = (
+            attention_mask.cumsum(1) - attention_mask.long()
+        )  # exclusive cumsum
         output = lm_backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -88,16 +92,25 @@ def get_just_reward(
     # In latter case we need to get the final value of the sequence
     else:
         # Will error if query_responses is entirely pad tokens as last_non_pad_tkn_idxs will be -1
-        last_non_pad_tkn_idxs = query_responses.size(-1) - first_true_indices(
-            torch.flip(query_responses, dims=(-1,)) == pad_token_id
-        ) - 1
+        last_non_pad_tkn_idxs = (
+            query_responses.size(-1)
+            - first_true_indices(
+                torch.flip(query_responses, dims=(-1,)) == pad_token_id
+            )
+            - 1
+        )
         return full_rewards[
             torch.arange(full_rewards.size(0), device=full_rewards.device),
             last_non_pad_tkn_idxs,
         ]
 
 
-def calc_logprob(idx: int, response: torch.Tensor, logitss: torch.Tensor, local_rollout_forward_batch_size: int):
+def calc_logprob(
+    idx: int,
+    response: torch.Tensor,
+    logitss: torch.Tensor,
+    local_rollout_forward_batch_size: int,
+):
     # Get the logits for all tokens at each step of the generation.
     logits = logitss[idx : idx + local_rollout_forward_batch_size]
 
@@ -105,26 +118,30 @@ def calc_logprob(idx: int, response: torch.Tensor, logitss: torch.Tensor, local_
     all_logprob = F.log_softmax(logits, dim=-1)
 
     # Get only those log-probabilities for the tokens that were actually generated.
-    logprob = torch.gather(
-        all_logprob, 2, response.unsqueeze(-1)
-    ).squeeze(-1)
+    logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
 
     return logprob
 
 
-def calc_ref_logprob(ref_policy, query_response, response, pad_token_id: int, context_length: int, ref_temperature: float):
-    # This computes the log-probabilities for the base model (reference model)
-    ref_output = forward(
-        ref_policy, query_response, pad_token_id
-    )
-    ref_logits = ref_output.logits[:, context_length - 1 : -1]
-    ref_logits /= ref_temperature + 1e-7
-    ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
+def calc_ref_logprob(
+    ref_policy,
+    query_response,
+    response,
+    pad_token_id: int,
+    context_length: int,
+    ref_temperature: float,
+):
+    with torch.no_grad():
+        # This computes the log-probabilities for the base model (reference model)
+        ref_output = forward(ref_policy, query_response, pad_token_id)
+        ref_logits = ref_output.logits[:, context_length - 1 : -1]
+        ref_logits /= ref_temperature + 1e-7
+        ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
 
-    # Get only those log-probabilities for the tokens that were actually generated.
-    ref_logprob = torch.gather(
-        ref_all_logprob, 2, response.unsqueeze(-1)
-    ).squeeze(-1)
+        # Get only those log-probabilities for the tokens that were actually generated.
+        ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(
+            -1
+        )
 
     return ref_logprob
 
@@ -160,7 +177,7 @@ def rollouts_to_loss_variables(
         context_length (int): The length of the context.
         stop_token_id (Optional[int]): The stop_token_id.
         response_truncation_sequences (list[list[int]]): Token id sequences at which to truncate the responses (inclusive).
-        local_rollout_forward_batch_size (int): The number of rollouts to process simultaneously 
+        local_rollout_forward_batch_size (int): The number of rollouts to process simultaneously
         ref_temperature (float): The ref_temperature to use for the reference model.
         device (torch.device): The device to run the model on.
 
@@ -185,15 +202,11 @@ def rollouts_to_loss_variables(
 
     # Note: local_rollout_forward_batch_size gives how many token generation steps we chunk trajectories into.
     # Iterate through chunks of the queries, moving along by the local_rollout_forward_batch_size each time.
-    for i in range(
-        0, queries.shape[0], local_rollout_forward_batch_size
-    ):
+    for i in range(0, queries.shape[0], local_rollout_forward_batch_size):
         # Extract the query
         query = queries[i : i + local_rollout_forward_batch_size]
         # Extract the corresponding response
-        query_response = query_responses[
-            i : i + local_rollout_forward_batch_size
-        ]
+        query_response = query_responses[i : i + local_rollout_forward_batch_size]
         # Discard the first context_length tokens.
         response = query_response[:, context_length:]
 
@@ -201,7 +214,12 @@ def rollouts_to_loss_variables(
         torch.cuda.empty_cache()
 
         ref_logprob = calc_ref_logprob(
-            ref_policy, query_response, response, pad_token_id, context_length, ref_temperature
+            ref_policy,
+            query_response,
+            response,
+            pad_token_id,
+            context_length,
+            ref_temperature,
         )
         torch.cuda.empty_cache()
 
@@ -214,9 +232,7 @@ def rollouts_to_loss_variables(
                 stop_token_id, pad_token_id, response
             )
 
-        if (
-            response_truncation_sequences is not None
-        ):
+        if response_truncation_sequences is not None:
             postprocessed_response = truncate_response_from_sequences(
                 response_truncation_sequences, pad_token_id, response
             )
@@ -225,15 +241,8 @@ def rollouts_to_loss_variables(
 
         # FLAG - This feels inefficient for when the action-value function is a head on the model doing the generation
         # Maybe there's a way to get around this. For now, we might just want separate models.
-        postprocessed_query_response = torch.cat(
-            (query, postprocessed_response), 1
-        )
-        sequence_length = (
-            first_true_indices(
-                postprocessed_response == pad_token_id
-            )
-            - 1
-        )
+        postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
+        sequence_length = first_true_indices(postprocessed_response == pad_token_id) - 1
         # It looks like TRL treates rewards and values the same way.
         # We might need our own class for action-value functions.
         # full_value has shape [batch, query_length, 1]
@@ -286,4 +295,3 @@ def rollouts_to_loss_variables(
         scores,
         state_values,
     )
-
