@@ -454,7 +454,12 @@ class OnPolicyTrainer(ABC, Trainer):
         self, output_dir: Optional[str] = None, _internal_call: bool = False
     ):
         backup_model = self.model
-        self.model = self.model.policy  # save only the policy
+
+        # Unwrap to fix bug that when model is a DataDistributedParallel it had no policy obj
+        self.accelerator.wait_for_everyone()
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+
+        self.model = unwrapped_model.policy  # save only the policy
 
         if self.is_deepspeed_enabled:
             backup_deepspeed = self.deepspeed
