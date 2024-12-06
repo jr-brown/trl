@@ -17,6 +17,8 @@ import math
 import os
 import textwrap
 import time
+import logging
+
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 from abc import ABC, abstractmethod
@@ -70,6 +72,9 @@ ProcessingClass = PreTrainedTokenizerBase
 
 
 INVALID_LOGPROB = 1.0
+
+
+log = logging.getLogger(__name__)
 
 
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
@@ -487,7 +492,7 @@ class OnPolicyTrainer(ABC, Trainer):
 
     def train(self):
         """Train the model (wrapper around combination of policy and value LLMs).
-        This consists of config.num_total_batches calls of the `_batch_update` method 
+        This consists of config.num_total_batches calls of the `_batch_update` method
         (which should be implemented for each subclass).
         Each batch update consists of a single forward rollout on a batch of queries
         and then multiple epochs of training with this batch of data. """
@@ -579,6 +584,14 @@ class OnPolicyTrainer(ABC, Trainer):
             ):
                 self.generate_eval_completions(sampling=True)
                 torch.cuda.empty_cache()
+
+            # Units are minutes for time_taken and time_limit
+            time_taken = (time.time() - start_time) / 60
+            time_limit = config.time_limit_mins
+
+            if time_limit is not None and time_taken > time_limit:
+                log.info(f"Training run has timed-out, {time_taken=:.5}mins {time_limit=:.5}mins")
+                break
 
         # HF trainer specifics
         self.control = self.callback_handler.on_train_end(

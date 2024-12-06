@@ -1048,6 +1048,7 @@ class OnPolicyConfig(TrainingArguments):
     local_mini_batch_size: Optional[int] = None
     mini_batch_size: Optional[int] = None
     push_to_hub: bool = False
+    time_limit_mins: Optional[float] = None
 
 
 def first_true_indices(bools: torch.Tensor, dtype=torch.long):
