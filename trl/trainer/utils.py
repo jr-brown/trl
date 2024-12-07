@@ -1124,28 +1124,6 @@ def get_reward(
     )
 
 
-def retokenize(
-    input_ids: torch.Tensor,
-    device,
-    source_processing_class: PreTrainedTokenizerBase,
-    target_processing_class: PreTrainedTokenizerBase | None = None,
-) -> tuple[torch.Tensor, int | None]:
-
-    if target_processing_class is None:
-        return input_ids, source_processing_class.pad_token_id
-
-    else:
-        decoded_batch = source_processing_class.batch_decode(input_ids, skip_special_tokens=True)
-        new_inputs = target_processing_class(
-            decoded_batch,
-            return_tensors="pt",
-            truncation=True,
-            padding="max_length",
-        )["input_ids"]
-        new_inputs = new_inputs.to(device)
-        return new_inputs, target_processing_class.pad_token_id
-
-
 def forward(
     model: torch.nn.Module,
     query_responses: torch.Tensor,

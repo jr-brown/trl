@@ -2,13 +2,36 @@ import torch
 import torch.utils.data
 import torch.nn.functional as F
 
+from transformers import PreTrainedTokenizerBase
+
 from ..trainer.utils import (
     first_true_indices,
     forward,
-    retokenize,
     truncate_response,
     truncate_response_from_sequences,
 )
+
+
+def retokenize(
+    input_ids: torch.Tensor,
+    device,
+    source_processing_class: PreTrainedTokenizerBase,
+    target_processing_class: PreTrainedTokenizerBase | None = None,
+) -> tuple[torch.Tensor, int | None]:
+
+    if target_processing_class is None:
+        return input_ids, source_processing_class.pad_token_id
+
+    else:
+        decoded_batch = source_processing_class.batch_decode(input_ids, skip_special_tokens=True)
+        new_inputs = target_processing_class(
+            decoded_batch,
+            return_tensors="pt",
+            truncation=True,
+            padding="max_length",
+        )["input_ids"]
+        new_inputs = new_inputs.to(device)
+        return new_inputs, target_processing_class.pad_token_id
 
 
 def get_just_value(
@@ -18,27 +41,17 @@ def get_just_value(
     lm_backbone = getattr(model, model.base_model_prefix)
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
 
-    # Wrapping to allow for models which don't use position_ids, e.g. DistilBert
-    # These models also don't have the use_cache kwarg
-    if not hasattr(model, "use_position_ids") or model.use_position_ids:
-        position_ids = (
-            attention_mask.cumsum(1) - attention_mask.long()
-        )  # exclusive cumsum
-        output = lm_backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            return_dict=True,
-            output_hidden_states=True,
-            use_cache=False,  # otherwise mistral-based RM would error out
-        )
-    else:
-        output = lm_backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True,
-            output_hidden_states=True,
-        )
+    position_ids = (
+        attention_mask.cumsum(1) - attention_mask.long()
+    )  # exclusive cumsum
+    output = lm_backbone(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        return_dict=True,
+        output_hidden_states=True,
+        use_cache=False,  # otherwise mistral-based RM would error out
+    )
 
     return model.score(output.hidden_states[-1])
 
@@ -83,14 +96,18 @@ def get_just_reward(
             output_hidden_states=True,
         )
 
-    full_rewards = model.score(output.hidden_states[-1]).squeeze(-1)
+    full_rewards = model.score(output.hidden_states[-1])
 
     # Check if we've produced reward for whole sequence, or value for each token
-    if len(full_rewards.shape) == 1:
+    if full_rewards.ndim == 1:
         return full_rewards
 
     # In latter case we need to get the final value of the sequence
     else:
+        # Remove excess dimensions
+        # If we do this earlier, bs=1 and distilbert causes shape (1,) -> (), leading to error
+        full_rewards = full_rewards.squeeze(-1)
+
         # Will error if query_responses is entirely pad tokens as last_non_pad_tkn_idxs will be -1
         last_non_pad_tkn_idxs = (
             query_responses.size(-1)

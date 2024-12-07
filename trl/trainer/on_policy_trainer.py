@@ -53,14 +53,13 @@ from ..trainer.utils import (
     batch_generation,
     disable_dropout_in_model,
     exact_div,
-    retokenize,
     prepare_deepspeed,
     print_rich_table,
     truncate_response,
     truncate_response_from_sequences,
 )
 from .utils import generate_model_card
-from .on_policy_utils import get_just_reward
+from .on_policy_utils import get_just_reward, retokenize
 from ..trainer.utils import OnPolicyConfig
 
 if is_wandb_available():
@@ -642,10 +641,10 @@ class OnPolicyTrainer(ABC, Trainer):
 
                     if (
                         config.response_truncation_sequences is not None
-                    ):  
+                    ):
                         postprocessed_response = truncate_response_from_sequences(
-                            config.response_truncation_sequences, 
-                            processing_class.pad_token_id, 
+                            config.response_truncation_sequences,
+                            processing_class.pad_token_id,
                             response
                         )
 
