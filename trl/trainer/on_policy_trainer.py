@@ -206,7 +206,6 @@ class OnPolicyTrainer(ABC, Trainer):
 
         """
 
-
         """
         Base class for both PPO and KLQ.
         This was pulled out by Lennie in early November 2024.
@@ -328,7 +327,7 @@ class OnPolicyTrainer(ABC, Trainer):
         #########
         for module in [policy, ref_policy, value_model, reward_model]:
             disable_dropout_in_model(module)
-        if config.stop_token and config.stop_token == "eos":
+        if config.stop_token and config.stop_token == "eos":  ### FLAG
             config.stop_token_id = processing_class.eos_token_id
         self.model = PolicyAndValueWrapper(policy, value_model)
         self.model.config = policy.config  # needed for pushing to hub
@@ -494,7 +493,7 @@ class OnPolicyTrainer(ABC, Trainer):
         This consists of config.num_total_batches calls of the `_batch_update` method
         (which should be implemented for each subclass).
         Each batch update consists of a single forward rollout on a batch of queries
-        and then multiple epochs of training with this batch of data. """
+        and then multiple epochs of training with this batch of data."""
         config = self.args
         dataloader = self.dataloader
         assert self.processing_class is not None
@@ -589,7 +588,9 @@ class OnPolicyTrainer(ABC, Trainer):
             time_limit = config.time_limit_mins
 
             if time_limit is not None and time_taken > time_limit:
-                log.info(f"Training run has timed-out, {time_taken=:.5}mins {time_limit=:.5}mins")
+                log.info(
+                    f"Training run has timed-out, {time_taken=:.5}mins {time_limit=:.5}mins"
+                )
                 break
 
         # HF trainer specifics
@@ -639,13 +640,11 @@ class OnPolicyTrainer(ABC, Trainer):
                             response,
                         )
 
-                    if (
-                        config.response_truncation_sequences is not None
-                    ):
+                    if config.response_truncation_sequences is not None:
                         postprocessed_response = truncate_response_from_sequences(
                             config.response_truncation_sequences,
                             processing_class.pad_token_id,
-                            response
+                            response,
                         )
 
                     table["query"].extend(
