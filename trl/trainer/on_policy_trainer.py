@@ -590,7 +590,7 @@ class OnPolicyTrainer(ABC, Trainer):
             time_limit = config.time_limit_mins
 
             if time_limit is not None and time_taken > time_limit:
-                log.info(f"Training run has timed-out, {time_taken=:.5}mins {time_limit=:.5}mins")
+                log.info(f"Training run has timed-out, {time_taken=}mins {time_limit=}mins")
                 break
 
         # HF trainer specifics
