@@ -51,6 +51,7 @@ class PPOStats:
         self.policy_gradient_loss_stats = torch.zeros(stats_shape, device=device)
         self.value_function_loss_stats = torch.zeros(stats_shape, device=device)
         self.value_function_clipfrac_stats = torch.zeros(stats_shape, device=device)
+        self.total_loss_stats = torch.zeros(stats_shape, device=device)
         self.entropy_stats = torch.zeros(stats_shape, device=device)
         self.ratio_stats = torch.zeros(stats_shape, device=device)
 
@@ -62,8 +63,9 @@ class PPOStats:
         policy_gradient_loss: torch.Tensor,
         state_value_function_loss: torch.Tensor,
         state_value_function_clipfrac: torch.Tensor,
+        total_loss: torch.Tensor,
         entropy_mean: torch.Tensor,
-        ratio_mean: torch.Tensor,
+        new_prev_prob_ratio_mean: torch.Tensor,
     ):
         self.approximate_kl_stats[update_location] = approximate_kl_mean
         self.policy_gradient_clipfrac_stats[update_location] = policy_gradient_clipfrac
@@ -72,8 +74,9 @@ class PPOStats:
         self.value_function_clipfrac_stats[update_location] = (
             state_value_function_clipfrac
         )
+        self.total_loss_stats[update_location] = total_loss
         self.entropy_stats[update_location] = entropy_mean
-        self.ratio_stats[update_location] = ratio_mean
+        self.ratio_stats[update_location] = new_prev_prob_ratio_mean
 
 
 def ppo_micro_batch_updates(
@@ -169,10 +172,12 @@ def ppo_micro_batch_updates(
 
             # Compute the policy gradient loss term.
             logprobs_diff = new_logprobs - micro_batch_logprobs
-            ratio = torch.exp(logprobs_diff)
-            policy_gradient_losses_unclipped = -micro_batch_advantage * ratio
+            new_prev_prob_ratio = torch.exp(logprobs_diff)
+            policy_gradient_losses_unclipped = (
+                -micro_batch_advantage * new_prev_prob_ratio
+            )
             policy_gradient_losses_clipped = -micro_batch_advantage * torch.clamp(
-                ratio, 1.0 - config.cliprange, 1.0 + config.cliprange
+                new_prev_prob_ratio, 1.0 - config.cliprange, 1.0 + config.cliprange
             )
             policy_gradient_losses_max = torch.max(
                 policy_gradient_losses_unclipped,
@@ -182,10 +187,12 @@ def ppo_micro_batch_updates(
                 policy_gradient_losses_max,
                 ~padding_mask[micro_batch_inds],
             )
-            loss = policy_gradient_loss + config.vf_coef * state_value_function_loss
+            total_loss = (
+                policy_gradient_loss + config.vf_coef * state_value_function_loss
+            )
 
             # Perform the update step.
-            accelerator.backward(loss)
+            accelerator.backward(total_loss)
             optimizer.step()
             optimizer.zero_grad()
 
@@ -198,10 +205,13 @@ def ppo_micro_batch_updates(
                     ).float(),
                     ~padding_mask[micro_batch_inds],
                 )
+
                 prob_dist = torch.nn.functional.softmax(logits, dim=-1)
                 entropy = torch.logsumexp(logits, dim=-1) - torch.sum(
                     prob_dist * logits, dim=-1
                 )
+                avg_entropy = masked_mean(entropy, ~padding_mask[micro_batch_inds])
+
                 approximate_kl = 0.5 * (logprobs_diff**2).mean()
                 # create a slice object for the indices that we want to populate
                 update_location = (
@@ -216,8 +226,9 @@ def ppo_micro_batch_updates(
                     policy_gradient_loss,
                     state_value_function_loss,
                     state_value_function_clipfrac,
-                    entropy.mean(),
-                    ratio.mean(),
+                    total_loss,
+                    avg_entropy,
+                    new_prev_prob_ratio.mean(),
                 )
         gradient_accumulation_idx += 1
 
@@ -305,8 +316,11 @@ def ppo_batch_update(
         state_values = torch.masked_fill(state_values, padding_mask_plus_one, 0)
 
         # 4. compute rewards
-        kl = logprobs - ref_logprobs
-        non_score_reward = -config.kl_coef * kl
+        prev_ref_log_ratio = logprobs - ref_logprobs
+        prev_ref_log_ratio = torch.masked_fill(
+            prev_ref_log_ratio, padding_mask, 0
+        )  # Set the log-ratio to 0 for padding tokens.
+        non_score_reward = -config.kl_coef * prev_ref_log_ratio
         # rewards has shape [batch, response_length]
         rewards = non_score_reward.clone()
         batch_indices = torch.arange(rewards.size(0), device=rewards.device)
@@ -383,33 +397,48 @@ def ppo_batch_update(
 
     # At the end of the update phase, log a bunch of statistics in the metrics dictionary.
     with torch.no_grad():
-        mean_kl = kl.sum(1).mean()
-        mean_entropy = (-logprobs).sum(1).mean()
+        # Depreciated. This was just the sampled log ratio.
+        # mean_kl = kl.sum(1).mean()
+
+        # This *does not* compute the entropy.
+        # logprobs has shape [batch, response_length]
+        # So this computes the total negative log likelihood of the responses.
+        # Additionally, because the logprobs are filled with INVALID_LOGPROB, the sum will be invalid.
+        # As a result, this is pretty meaningless.
+        # mean_entropy = (-logprobs).sum(1).mean()
         mean_non_score_reward = non_score_reward.sum(1).mean()
-        rlhf_reward = mean_non_score_reward + scores.mean()
+        mean_rlhf_reward = mean_non_score_reward + scores.mean()
+
         metrics = {}
 
         # Refactor the metric caching to make it easier to parse
         s = ppo_stats
         metrics_gathered_and_meaned = {
-            "objective/kl": mean_kl,
-            "objective/entropy": mean_entropy,
-            "objective/non_score_reward": mean_non_score_reward,
-            "objective/rlhf_reward": rlhf_reward,
-            "objective/scores": scores.mean(),
+            # "objective/kl": mean_kl, # no longer logging this, because it's badly named.
+            # "objective/entropy": mean_entropy, # no longer logging this, because it's meaningless.
+            "objective/traj/non_score_reward": mean_non_score_reward,
+            "objective/traj/rlhf_reward": mean_rlhf_reward,
+            "objective/traj/scores": scores.mean(),
+            #
+            "policy/token/entropy": s.entropy_stats,
+            "policy/traj/prev_ref_log_ratio": prev_ref_log_ratio.sum(1).mean(),
             "policy/approximate_kl_avg": s.approximate_kl_stats,
-            "policy/clipfrac_avg": s.policy_gradient_clipfrac_stats,
-            "loss/policy_avg": s.policy_gradient_loss_stats,
-            "loss/value_avg": s.value_function_loss_stats,
+            "policy/token/clipfrac_avg": s.policy_gradient_clipfrac_stats,
+            #
+            "loss/token/policy_loss": s.policy_gradient_loss_stats,
+            "loss/token/state_value_loss": s.value_function_loss_stats,
+            "loss/token/total_loss": s.total_loss_stats,
+            #
             "val/clipfrac_avg": s.value_function_clipfrac_stats,
-            "policy/entropy_avg": s.entropy_stats,
-            "val/ratio": s.ratio_stats,
+            "val/new_prev_prob_ratio": s.ratio_stats,
         }
         for m_name, m_tensor in metrics_gathered_and_meaned.items():
             metrics[m_name] = accelerator.gather(m_tensor).mean().item()
 
-        metrics["val/ratio_var"] = accelerator.gather(s.ratio_stats).var().item()
-        metrics["val/num_eos_tokens"] = (
+        metrics["val/new_prev_prob_ratio_var"] = (
+            accelerator.gather(s.ratio_stats).var().item()
+        )
+        metrics["objective/traj/num_eos_tokens"] = (
             (responses == processing_class.eos_token_id).sum().item()
         )
 
