@@ -337,7 +337,7 @@ class OnPolicyTrainer(ABC, Trainer):
         #########
         for module in [policy, ref_policy, value_model, reward_model]:
             disable_dropout_in_model(module)
-        if config.stop_token and config.stop_token == "eos":
+        if config.stop_token and config.stop_token == "eos":  ### FLAG
             config.stop_token_id = processing_class.eos_token_id
         self.model = PolicyAndValueWrapper(policy, value_model)
         self.model.config = policy.config  # needed for pushing to hub
@@ -599,7 +599,7 @@ class OnPolicyTrainer(ABC, Trainer):
 
             if time_limit is not None and time_taken > time_limit:
                 log.info(
-                    f"Training run has timed-out, {time_taken=:.5}mins {time_limit=:.5}mins"
+                    f"Training run has timed-out, {time_taken=}mins {time_limit=}mins"
                 )
                 break
 

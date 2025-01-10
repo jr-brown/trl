@@ -427,7 +427,9 @@ def klq_batch_update(
         )
         if config.missing_eos_penalty is not None:
             scores[~contain_eos_token] -= config.missing_eos_penalty
-        # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
+        accelerator.print(
+            f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}"
+        )
 
         # be very careful with `padding_mask_plus_one`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
         response_idxs = torch.arange(
