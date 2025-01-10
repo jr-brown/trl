@@ -60,6 +60,41 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
     --stop_token eos
 """
 
+# Lennie's versions for local debugging
+
+"""
+python examples/scripts/ppo/ppo_tldr.py \
+    --dataset_name trl-internal-testing/tldr-preference-sft-trl-style \
+    --dataset_test_split validation \
+    --learning_rate 1.41e-5 \
+    --output_dir local/ppo_test \
+    --per_device_train_batch_size 2 \
+    --gradient_accumulation_steps 1 \
+    --total_episodes 10000 \
+    --model_name_or_path gpt2 \
+    --sft_model_path gpt2 \
+    --reward_model_path EleutherAI/pythia-70m \
+    --missing_eos_penalty 1.0 \
+    --stop_token eos \
+    --response_length 53
+
+accelerate launch --config_file examples/accelerate_configs/deepspeed_zero_lite.yaml \
+    examples/scripts/ppo/ppo_tldr.py \
+    --dataset_name trl-internal-testing/tldr-preference-sft-trl-style \
+    --dataset_test_split validation \
+    --output_dir local/ppo_test \
+    --learning_rate 1.41e-5 \
+    --per_device_train_batch_size 2 \
+    --gradient_accumulation_steps 1 \
+    --total_episodes 10000 \
+    --model_name_or_path gpt2 \
+    --sft_model_path gpt2 \
+    --reward_model_path EleutherAI/pythia-70m \
+    --local_rollout_forward_batch_size 2 \
+    --missing_eos_penalty 1.0 \
+    --stop_token eos
+"""
+
 
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, PPOConfig, ModelConfig))
@@ -79,10 +114,14 @@ if __name__ == "__main__":
     if tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
     value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_config.trust_remote_code, num_labels=1
+        training_args.reward_model_path,
+        trust_remote_code=model_config.trust_remote_code,
+        num_labels=1,
     )
     reward_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_config.trust_remote_code, num_labels=1
+        training_args.reward_model_path,
+        trust_remote_code=model_config.trust_remote_code,
+        num_labels=1,
     )
     ref_policy = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_config.trust_remote_code
@@ -120,10 +159,16 @@ if __name__ == "__main__":
         train_dataset = prepare_dataset(train_dataset, tokenizer)
         eval_dataset = prepare_dataset(eval_dataset, tokenizer)
         # filtering
-        train_dataset = train_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
-        eval_dataset = eval_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
+        train_dataset = train_dataset.filter(
+            lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc
+        )
+        eval_dataset = eval_dataset.filter(
+            lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc
+        )
 
-    assert train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id, "The last token should not be an EOS token"
+    assert (
+        train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id
+    ), "The last token should not be an EOS token"
     ################
     # Training
     ################
@@ -136,6 +181,8 @@ if __name__ == "__main__":
         value_model=value_model,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        reward_model_processing_class=tokenizer,  # added by Lennie so that can try running
+        # logic is that in this script the reward model has the same tokenizer as the policy etc
     )
     trainer.train()
 
