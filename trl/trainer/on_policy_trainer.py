@@ -26,7 +26,7 @@ from abc import ABC, abstractmethod
 import pandas as pd
 import torch
 import torch.nn as nn
-from accelerate import Accelerator
+from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.utils import broadcast, gather_object
 from datasets import Dataset
 from torch.utils.data import DataLoader
@@ -206,7 +206,6 @@ class OnPolicyTrainer(ABC, Trainer):
 
         """
 
-
         """
         Base class for both PPO and KLQ.
         This was pulled out by Lennie in early November 2024.
@@ -272,9 +271,19 @@ class OnPolicyTrainer(ABC, Trainer):
             config.total_episodes = int(
                 config.num_train_epochs * self.train_dataset_len
             )
-        accelerator = Accelerator(
-            gradient_accumulation_steps=config.gradient_accumulation_steps
-        )
+
+        # Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+        if os.environ.get("ACCELERATE_USE_DEEPSPEED", "false") == "true":
+            # Create plugin with same configuration as would be set by launch command
+            deepspeed_plugin = DeepSpeedPlugin(
+                zero_stage=1,  # Matching your yaml config
+                gradient_accumulation_steps=config.gradient_accumulation_steps,
+            )
+            accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+        else:
+            accelerator = Accelerator(
+                gradient_accumulation_steps=config.gradient_accumulation_steps
+            )
         self.accelerator = accelerator
 
         # The number of processes we're using
@@ -494,7 +503,7 @@ class OnPolicyTrainer(ABC, Trainer):
         This consists of config.num_total_batches calls of the `_batch_update` method
         (which should be implemented for each subclass).
         Each batch update consists of a single forward rollout on a batch of queries
-        and then multiple epochs of training with this batch of data. """
+        and then multiple epochs of training with this batch of data."""
         config = self.args
         dataloader = self.dataloader
         assert self.processing_class is not None
@@ -589,7 +598,9 @@ class OnPolicyTrainer(ABC, Trainer):
             time_limit = config.time_limit_mins
 
             if time_limit is not None and time_taken > time_limit:
-                log.info(f"Training run has timed-out, {time_taken=:.5}mins {time_limit=:.5}mins")
+                log.info(
+                    f"Training run has timed-out, {time_taken=:.5}mins {time_limit=:.5}mins"
+                )
                 break
 
         # HF trainer specifics
@@ -639,13 +650,11 @@ class OnPolicyTrainer(ABC, Trainer):
                             response,
                         )
 
-                    if (
-                        config.response_truncation_sequences is not None
-                    ):
+                    if config.response_truncation_sequences is not None:
                         postprocessed_response = truncate_response_from_sequences(
                             config.response_truncation_sequences,
                             processing_class.pad_token_id,
-                            response
+                            response,
                         )
 
                     table["query"].extend(
