@@ -61,7 +61,9 @@ def l2_loss(
     config,
     tensors: LossFunctionTensors,
 ):
-    return torch.square(tensors.action_value_prediction - tensors.micro_batch_return)
+    return 0.5 * torch.square(
+        tensors.action_value_prediction - tensors.micro_batch_return
+    )
 
 
 def huber_loss(
@@ -208,12 +210,13 @@ class KLQStats:
         self.loss_function_stats = torch.zeros(stats_shape, device=device)
         self.action_value_stats = torch.zeros(stats_shape, device=device)
         self.state_value_stats = torch.zeros(stats_shape, device=device)
-        self.log_ratio_new_ref_stats = torch.zeros(stats_shape, device=device)
+        self.advantage_stats = torch.zeros(stats_shape, device=device)
+        # self.log_ratio_new_ref_stats = torch.zeros(stats_shape, device=device)
         self.entropy_stats = torch.zeros(stats_shape, device=device)
-        self.kl_prev_ref_stats = torch.zeros(stats_shape, device=device)
-        self.kl_new_ref_stats = torch.zeros(stats_shape, device=device)
-        self.kl_prev_new_stats = torch.zeros(stats_shape, device=device)
-        self.kl_new_prev_stats = torch.zeros(stats_shape, device=device)
+        self.prev_ref_log_ratio_stats = torch.zeros(stats_shape, device=device)
+        # self.kl_new_ref_stats = torch.zeros(stats_shape, device=device)
+        self.prev_new_log_ratio_stats = torch.zeros(stats_shape, device=device)
+        # self.kl_new_prev_stats = torch.zeros(stats_shape, device=device)
 
     def update(
         self,
@@ -221,22 +224,25 @@ class KLQStats:
         action_value_function_loss,
         action_value_prediction,
         state_value_prediction,
-        new_ref_log_ratio,
+        # new_ref_log_ratio,
         entropy,
-        kl_prev_ref,
-        kl_new_ref,
-        kl_prev_new,
-        kl_new_prev,
+        prev_ref_log_ratio,
+        # kl_new_ref,
+        prev_new_log_ratio,
+        # kl_new_prev,
     ):
         self.loss_function_stats[update_location] = action_value_function_loss
         self.action_value_stats[update_location] = action_value_prediction
         self.state_value_stats[update_location] = state_value_prediction
-        self.log_ratio_new_ref_stats[update_location] = new_ref_log_ratio
+        self.advantage_stats[update_location] = (
+            action_value_prediction - state_value_prediction
+        )
+        # self.log_ratio_new_ref_stats[update_location] = new_ref_log_ratio
         self.entropy_stats[update_location] = entropy
-        self.kl_prev_ref_stats[update_location] = kl_prev_ref
-        self.kl_new_ref_stats[update_location] = kl_new_ref
-        self.kl_prev_new_stats[update_location] = kl_prev_new
-        self.kl_new_prev_stats[update_location] = kl_new_prev
+        self.prev_ref_log_ratio_stats[update_location] = prev_ref_log_ratio
+        # self.kl_new_ref_stats[update_location] = kl_new_ref
+        self.prev_new_log_ratio_stats[update_location] = prev_new_log_ratio
+        # self.kl_new_prev_stats[update_location] = kl_new_prev
 
 
 def micro_batch_updates(
@@ -301,11 +307,24 @@ def micro_batch_updates(
             state_value_prediction = torch.masked_fill(
                 state_value_prediction, padding_mask_plus_one[micro_batch_inds], 0
             )
+            # This is for logging
+            mean_state_value_prediction = masked_mean(
+                state_value_prediction, ~padding_mask_plus_one[micro_batch_inds]
+            )
+
             new_ref_log_ratio = new_logprobs - micro_batch_ref_logprobs
             prev_ref_log_ratio = micro_batch_prev_logprobs - micro_batch_ref_logprobs
             action_value_prediction = (
                 config.kl_coef * (new_ref_log_ratio) + state_value_prediction
             )
+            action_value_prediction = torch.masked_fill(
+                action_value_prediction, padding_mask_plus_one[micro_batch_inds], 0
+            )  # TODO: I'm quite unsure about whether this should be padding mask or padding mask plus one.
+
+            # This is for logging
+            mean_action_value_prediction = masked_mean(
+                action_value_prediction, ~padding_mask_plus_one[micro_batch_inds]
+            )  # TODO: Again, unsure about pm or pm+1
 
             # Compute loss
             action_value_function_losses = loss_function_map[config.loss_function](
@@ -322,7 +341,6 @@ def micro_batch_updates(
             action_value_function_loss = masked_mean(
                 action_value_function_losses, ~padding_mask_plus_one[micro_batch_inds]
             )
-
             # Perform the update step.
             accelerator.backward(action_value_function_loss)
             optimizer.step()
@@ -330,14 +348,28 @@ def micro_batch_updates(
 
             # This is all just for logging.
             with torch.no_grad():
+
+                # Logits has shape [batch, response_length, vocab_size]
                 prob_dist = torch.nn.functional.softmax(logits, dim=-1)
+                # prob_dist has shape [batch, response_length, vocab_size]
                 entropy = torch.logsumexp(logits, dim=-1) - torch.sum(
                     prob_dist * logits, dim=-1
                 )
+                # entropy has shape [batch, response_length]
+                avg_entropy = masked_mean(entropy, ~padding_mask[micro_batch_inds])
+                # avg_entropy is a scalar.
+                # avg_entropy is the average entropy of the probability distribution at each non-padding token in the completion.
+
                 prev_new_log_ratio = micro_batch_prev_logprobs - new_logprobs
+                prev_new_log_ratio = torch.masked_fill(
+                    prev_new_log_ratio, padding_mask[micro_batch_inds], 0
+                )
                 prev_ref_log_ratio = micro_batch_prev_logprobs - ref_logprobs
-                new_prev_log_ratio = -prev_new_log_ratio
-                new_prev_ratio = torch.exp(new_prev_log_ratio)
+                prev_ref_log_ratio = torch.masked_fill(
+                    prev_ref_log_ratio, padding_mask[micro_batch_inds], 0
+                )
+                # new_prev_log_ratio = -prev_new_log_ratio
+                # new_prev_ratio = torch.exp(new_prev_log_ratio)
 
                 update_location = (
                     epoch_idx,
@@ -346,15 +378,15 @@ def micro_batch_updates(
                 )
                 stats.update(
                     update_location,
-                    action_value_function_loss=action_value_function_loss.mean(),
-                    action_value_prediction=action_value_prediction.mean(),
-                    state_value_prediction=state_value_prediction.mean(),
-                    new_ref_log_ratio=new_ref_log_ratio.mean(),
-                    entropy=entropy.mean(),
-                    kl_prev_ref=prev_ref_log_ratio.mean(),
-                    kl_new_ref=(new_prev_ratio * new_ref_log_ratio).mean(),
-                    kl_prev_new=prev_new_log_ratio.mean(),
-                    kl_new_prev=(new_prev_ratio * new_prev_log_ratio).mean(),
+                    action_value_function_loss=action_value_function_loss,
+                    action_value_prediction=mean_action_value_prediction,
+                    state_value_prediction=mean_state_value_prediction,
+                    # new_ref_log_ratio=new_ref_log_ratio.sum(1).mean(),
+                    entropy=avg_entropy,
+                    prev_ref_log_ratio=prev_ref_log_ratio.sum(1).mean(),
+                    # kl_new_ref=(new_prev_ratio * new_ref_log_ratio).sum(1).mean(),
+                    prev_new_log_ratio=prev_new_log_ratio.sum(1).mean(),
+                    # kl_new_prev=(new_prev_ratio * new_prev_log_ratio).sum(1).mean(),
                 )
         gradient_accumulation_idx += 1
     minibatch_idx += 1
@@ -444,6 +476,14 @@ def klq_batch_update(
         action_values = torch.masked_fill(action_values, padding_mask_plus_one, 0)
 
         # 4. compute rewards
+        prev_ref_log_ratio = logprobs - ref_logprobs  # This is just for logging!
+        prev_ref_log_ratio = torch.masked_fill(
+            prev_ref_log_ratio, padding_mask, 0
+        )  # Set the log-ratio to 0 for padding tokens.
+        non_score_reward = (
+            -config.kl_coef * prev_ref_log_ratio
+        )  # This is just for logging!
+
         # rewards has shape [batch, response_length]
         rewards = torch.zeros_like(logprobs)
         batch_indices = torch.arange(
@@ -536,31 +576,45 @@ def klq_batch_update(
 
     # At the end of training, log a bunch of statistics in the metrics dictionary.
     with torch.no_grad():
-        mean_entropy = (-logprobs).sum(1).mean()
+        # Depreciated -
+        # This computation is incorrect, and does not compute entropy correctly.
+        # See the ppo_trainer.py for an explanation.
+        # mean_entropy = (-logprobs).sum(1).mean()
+
+        # The sum the non-score reward over the response length, and then take the mean over the batch.
+        mean_non_score_reward = non_score_reward.sum(1).mean()
+        # Compute the RLHF reward by adding the mean non-score reward to the mean score.
+        mean_rlhf_reward = mean_non_score_reward + scores.mean()
 
         metrics = {}
         s = klq_stats
         metrics_gathered_and_meaned = {
-            "objective/scores": scores.mean(),
-            "objective/kl_prev_ref": s.kl_prev_ref_stats,
-            "loss/avg_value_loss": s.loss_function_stats,
-            "value_function/avg_state_value": s.state_value_stats,
-            "value_function/avg_action_value": s.action_value_stats,
-            "value_function/avg_log_ratio": s.log_ratio_new_ref_stats,
-            "policy/entropy": s.entropy_stats,
-            "policy/kl_new_prev": s.kl_new_prev_stats,
-            "policy/kl_prev_new": s.kl_prev_new_stats,
-            "policy/kl_new_ref": s.kl_new_ref_stats,
+            "objective/traj/non_score_reward": mean_non_score_reward,
+            "objective/traj/rlhf_reward": mean_rlhf_reward,
+            "objective/traj/scores": scores.mean(),
+            #
+            "policy/token/entropy": s.entropy_stats,
+            "policy/traj/prev_ref_log_ratio": s.prev_ref_log_ratio_stats,
+            "policy/traj/prev_new_log_ratio": s.prev_new_log_ratio_stats,
+            # "policy/kl_new_prev": s.kl_new_prev_stats,
+            # "policy/kl_prev_new": s.kl_prev_new_stats,
+            # "policy/kl_new_ref": s.kl_new_ref_stats,
+            #
+            "loss/token/action_value_loss": s.loss_function_stats,
+            #
+            "value_function/token/state_value": s.state_value_stats,
+            "value_function/token/action_value": s.action_value_stats,
+            "value_function/token/advantage": s.advantage_stats,
         }
         for m_name, m_tensor in metrics_gathered_and_meaned.items():
             metrics[m_name] = accelerator.gather(m_tensor).mean().item()
 
         # Metrics that do not need gathering
-        metrics["objective/num_eos_tokens"] = (
+        metrics["objective/traj/num_eos_tokens"] = (
             (responses == processing_class.eos_token_id).sum().item()
         )
-        metrics["loss/avg_target_values"] = returns.mean().item()
-        metrics["loss/var_target_values"] = returns.var().item()
+        metrics["loss/token/target_value"] = returns.mean().item()
+        metrics["loss/token/target_value_var"] = returns.var().item()
 
     return metrics
 
