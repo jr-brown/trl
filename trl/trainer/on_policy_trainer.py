@@ -699,6 +699,7 @@ class OnPolicyTrainer(ABC, Trainer):
 
                 if wandb.run is not None:
                     wandb.log({"completions": wandb.Table(dataframe=df)})
+                    wandb.log({"avg_eval_score": df["score"].mean()})
 
     def create_model_card(
         self,

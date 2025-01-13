@@ -996,7 +996,7 @@ class OnPolicyConfig(TrainingArguments):
         stop_token_id (`Optional[int]`, *optional*, defaults to `None`):
             Truncation token id.
         response_truncation_sequences (`[List[List[int]]]`, *optional*, defaults to `None`):
-            Stop strings for generations from the model. 
+            Stop strings for generations from the model.
         temperature (`float`, *optional*, defaults to `0.7`):
             Sampling temperature.
         eval_temperature (`float`, *optional*, defaults to `0.7`):
