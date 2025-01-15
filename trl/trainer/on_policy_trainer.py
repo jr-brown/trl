@@ -26,6 +26,8 @@ from abc import ABC, abstractmethod
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.utils import broadcast, gather_object
 from datasets import Dataset
@@ -59,8 +61,8 @@ from ..trainer.utils import (
     truncate_response_from_sequences,
 )
 from .utils import generate_model_card
-from .on_policy_utils import get_just_reward, retokenize
-from ..trainer.utils import OnPolicyConfig
+from .on_policy_utils import get_just_reward, retokenize, calc_ref_logprob
+from ..trainer.utils import OnPolicyConfig, first_true_indices
 
 if is_wandb_available():
     import wandb
@@ -632,7 +634,7 @@ class OnPolicyTrainer(ABC, Trainer):
                 query = batch["input_ids"]
                 with torch.no_grad():
                     context_length = query.shape[1]
-                    query_response, _ = batch_generation(
+                    query_response, logits = batch_generation(
                         unwrapped_model.policy,
                         query,
                         query.shape[0],
@@ -684,12 +686,73 @@ class OnPolicyTrainer(ABC, Trainer):
                         reward_model_inputs,
                         reward_model_pad_token,
                     )
+
+                    # KL div and rlhf reward calc, see relevant code in on_policy_utils and ppo_trainer for explanatory comments
+
+                    all_logprob = F.log_softmax(logits, dim=-1)
+                    logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
+
+                    ref_logprob = calc_ref_logprob(
+                        self.ref_policy,
+                        query_response,
+                        response,
+                        processing_class.pad_token_id,
+                        context_length,
+                        config.ref_temperature,
+                    )
+
+                    sequence_length = first_true_indices(
+                        postprocessed_response == processing_class.pad_token_id
+                    ) - 1
+
+                    contain_eos_token = torch.any(
+                        postprocessed_response == processing_class.eos_token_id,
+                        dim=-1,
+                    )
+                    if config.missing_eos_penalty is not None:
+                        score[~contain_eos_token] -= config.missing_eos_penalty
+
+                    response_idx = torch.arange(
+                        response.shape[1], device=response.device
+                    ).repeat(response.shape[0], 1)
+                    padding_mask = response_idx > sequence_length.unsqueeze(1)
+                    logprob = torch.masked_fill(logprob, padding_mask, INVALID_LOGPROB)
+                    ref_logprob = torch.masked_fill(ref_logprob, padding_mask, INVALID_LOGPROB)
+                    sequence_length_plus_one = sequence_length + 1
+
+                    prev_ref_log_ratio = logprob - ref_logprob
+                    prev_ref_log_ratio = torch.masked_fill(
+                        prev_ref_log_ratio, padding_mask, 0
+                    )
+                    non_score_reward = -config.kl_coef * prev_ref_log_ratio
+
+                    reward = non_score_reward.clone()
+                    batch_indices = torch.arange(reward.size(0), device=reward.device)
+                    sequence_end_indices = torch.where(
+                        sequence_length_plus_one < reward.size(1),
+                        sequence_length_plus_one,
+                        sequence_length,
+                    )
+                    reward[[batch_indices, sequence_end_indices]] += score
+
+                    reward = torch.sum(reward, axis=1)
+                    prev_ref_log_ratio = torch.sum(prev_ref_log_ratio, axis=1)
+
+                    # Log metrics into pandas table
+
                     table["score"].extend(
                         self.accelerator.gather(score).float().cpu().numpy()
+                    )
+                    table["rlhf_reward"].extend(
+                        self.accelerator.gather(reward).float().cpu().numpy()
+                    )
+                    table["prev_ref_log_ratio"].extend(
+                        self.accelerator.gather(prev_ref_log_ratio).float().cpu().numpy()
                     )
 
                 if sampling:
                     break
+
         df = pd.DataFrame(table)
 
         if self.accelerator.is_main_process:
@@ -699,7 +762,9 @@ class OnPolicyTrainer(ABC, Trainer):
 
                 if wandb.run is not None:
                     wandb.log({"completions": wandb.Table(dataframe=df)})
-                    wandb.log({"avg_eval_score": df["score"].mean()})
+                    wandb.log({"eval/objective/traj/scores": df["score"].mean()})
+                    wandb.log({"eval/objective/traj/rlhf_reward": df["rlhf_reward"].mean()})
+                    wandb.log({"eval/policy/traj/prev_ref_log_ratio": df["prev_ref_log_ratio"].mean()})
 
     def create_model_card(
         self,

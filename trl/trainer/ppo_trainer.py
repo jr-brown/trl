@@ -343,6 +343,7 @@ def ppo_batch_update(
         last_gae = 0
         advantages_reversed = []
         gen_length = responses.shape[1]
+
         for t in reversed(range(gen_length)):
             nextvalues = state_values[:, t + 1] if t < gen_length - 1 else 0.0
             # Compute the TD-error
@@ -350,6 +351,7 @@ def ppo_batch_update(
             # Use the GAE backwards recursion relationship
             last_gae = delta + config.gamma * config.lam * last_gae
             advantages_reversed.append(last_gae)
+
         # Create the advantage estimates by reversing the GAE backward recursion
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         # Set the return estimates to be the advantage estimates
