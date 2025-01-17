@@ -364,7 +364,9 @@ def micro_batch_updates(
                 prev_new_log_ratio = torch.masked_fill(
                     prev_new_log_ratio, padding_mask[micro_batch_inds], 0
                 )
-                prev_ref_log_ratio = micro_batch_prev_logprobs - ref_logprobs
+                prev_ref_log_ratio = (
+                    micro_batch_prev_logprobs - micro_batch_ref_logprobs
+                )
                 prev_ref_log_ratio = torch.masked_fill(
                     prev_ref_log_ratio, padding_mask[micro_batch_inds], 0
                 )
