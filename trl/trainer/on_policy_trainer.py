@@ -749,6 +749,8 @@ class OnPolicyTrainer(ABC, Trainer):
                     table["prev_ref_log_ratio"].extend(
                         self.accelerator.gather(prev_ref_log_ratio).float().cpu().numpy()
                     )
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
                 if sampling:
                     break
