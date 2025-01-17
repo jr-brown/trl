@@ -615,6 +615,116 @@ class OnPolicyTrainer(ABC, Trainer):
                 config, self.state, self.control
             )
 
+    def _eval_completions_inner(
+        self,
+        config,
+        unwrapped_model,
+        query,
+        processing_class,
+        reward_model_processing_class,
+    ):
+        context_length = query.shape[1]
+        query_response, logits = batch_generation(
+            unwrapped_model.policy,
+            query,
+            query.shape[0],
+            processing_class.pad_token_id,
+            self.eval_generation_config,
+        )
+        response = query_response[:, context_length:]
+        postprocessed_response = response
+        if (
+            config.stop_token_id is not None
+        ):  # handle the edge case when stop_token_id exists but is 0
+            postprocessed_response = truncate_response(
+                config.stop_token_id,
+                processing_class.pad_token_id,
+                response,
+            )
+
+        if config.response_truncation_sequences is not None:
+            postprocessed_response = truncate_response_from_sequences(
+                config.response_truncation_sequences,
+                processing_class.pad_token_id,
+                response,
+            )
+
+        decoded_query = gather_object(
+            processing_class.batch_decode(query, skip_special_tokens=True)
+        )
+        decoded_response = gather_object(
+            processing_class.batch_decode(postprocessed_response)
+        )
+
+        postprocessed_query_response = torch.cat(
+            (query, postprocessed_response), 1
+        )
+        reward_model_inputs, reward_model_pad_token = retokenize(
+            postprocessed_query_response,
+            self.accelerator.device,
+            processing_class,
+            reward_model_processing_class,
+        )
+        score = get_just_reward(
+            self.reward_model,
+            reward_model_inputs,
+            reward_model_pad_token,
+        )
+
+        # KL div and rlhf reward calc, see relevant code in on_policy_utils and ppo_trainer for explanatory comments
+
+        all_logprob = F.log_softmax(logits, dim=-1)
+        logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
+
+        ref_logprob = calc_ref_logprob(
+            self.ref_policy,
+            query_response,
+            response,
+            processing_class.pad_token_id,
+            context_length,
+            config.ref_temperature,
+        )
+
+        sequence_length = first_true_indices(
+            postprocessed_response == processing_class.pad_token_id
+        ) - 1
+
+        contain_eos_token = torch.any(
+            postprocessed_response == processing_class.eos_token_id,
+            dim=-1,
+        )
+        if config.missing_eos_penalty is not None:
+            score[~contain_eos_token] -= config.missing_eos_penalty
+
+        response_idx = torch.arange(
+            response.shape[1], device=response.device
+        ).repeat(response.shape[0], 1)
+        padding_mask = response_idx > sequence_length.unsqueeze(1)
+        logprob = torch.masked_fill(logprob, padding_mask, INVALID_LOGPROB)
+        ref_logprob = torch.masked_fill(ref_logprob, padding_mask, INVALID_LOGPROB)
+        sequence_length_plus_one = sequence_length + 1
+
+        prev_ref_log_ratio = logprob - ref_logprob
+        prev_ref_log_ratio = torch.masked_fill(
+            prev_ref_log_ratio, padding_mask, 0
+        )
+        non_score_reward = -config.kl_coef * prev_ref_log_ratio
+
+        reward = non_score_reward.clone()
+        batch_indices = torch.arange(reward.size(0), device=reward.device)
+        sequence_end_indices = torch.where(
+            sequence_length_plus_one < reward.size(1),
+            sequence_length_plus_one,
+            sequence_length,
+        )
+        reward[[batch_indices, sequence_end_indices]] += score
+
+        reward = torch.sum(reward, axis=1)
+        prev_ref_log_ratio = torch.sum(prev_ref_log_ratio, axis=1)
+
+        return decoded_query, decoded_response, score, reward, prev_ref_log_ratio
+
+
     def generate_eval_completions(self, sampling: bool = False):
         """
         Generate completions for the eval dataset and log the completions and their scores.
@@ -633,113 +743,17 @@ class OnPolicyTrainer(ABC, Trainer):
             for batch in self.eval_dataloader:
                 query = batch["input_ids"]
                 with torch.no_grad():
-                    context_length = query.shape[1]
-                    query_response, logits = batch_generation(
-                        unwrapped_model.policy,
-                        query,
-                        query.shape[0],
-                        processing_class.pad_token_id,
-                        self.eval_generation_config,
+                    (
+                        decoded_query, decoded_response, score, reward, prev_ref_log_ratio
+                    ) = self._eval_completions_inner(
+                        config=config,
+                        unwrapped_model=unwrapped_model,
+                        query=query,
+                        processing_class=processing_class,
+                        reward_model_processing_class=reward_model_processing_class,
                     )
-                    response = query_response[:, context_length:]
-                    postprocessed_response = response
-                    if (
-                        config.stop_token_id is not None
-                    ):  # handle the edge case when stop_token_id exists but is 0
-                        postprocessed_response = truncate_response(
-                            config.stop_token_id,
-                            processing_class.pad_token_id,
-                            response,
-                        )
-
-                    if config.response_truncation_sequences is not None:
-                        postprocessed_response = truncate_response_from_sequences(
-                            config.response_truncation_sequences,
-                            processing_class.pad_token_id,
-                            response,
-                        )
-
-                    table["query"].extend(
-                        gather_object(
-                            processing_class.batch_decode(
-                                query, skip_special_tokens=True
-                            )
-                        )
-                    )
-                    table["model response"].extend(
-                        gather_object(
-                            processing_class.batch_decode(postprocessed_response)
-                        )
-                    )
-
-                    postprocessed_query_response = torch.cat(
-                        (query, postprocessed_response), 1
-                    )
-                    reward_model_inputs, reward_model_pad_token = retokenize(
-                        postprocessed_query_response,
-                        self.accelerator.device,
-                        processing_class,
-                        reward_model_processing_class,
-                    )
-                    score = get_just_reward(
-                        self.reward_model,
-                        reward_model_inputs,
-                        reward_model_pad_token,
-                    )
-
-                    # KL div and rlhf reward calc, see relevant code in on_policy_utils and ppo_trainer for explanatory comments
-
-                    all_logprob = F.log_softmax(logits, dim=-1)
-                    logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
-
-                    ref_logprob = calc_ref_logprob(
-                        self.ref_policy,
-                        query_response,
-                        response,
-                        processing_class.pad_token_id,
-                        context_length,
-                        config.ref_temperature,
-                    )
-
-                    sequence_length = first_true_indices(
-                        postprocessed_response == processing_class.pad_token_id
-                    ) - 1
-
-                    contain_eos_token = torch.any(
-                        postprocessed_response == processing_class.eos_token_id,
-                        dim=-1,
-                    )
-                    if config.missing_eos_penalty is not None:
-                        score[~contain_eos_token] -= config.missing_eos_penalty
-
-                    response_idx = torch.arange(
-                        response.shape[1], device=response.device
-                    ).repeat(response.shape[0], 1)
-                    padding_mask = response_idx > sequence_length.unsqueeze(1)
-                    logprob = torch.masked_fill(logprob, padding_mask, INVALID_LOGPROB)
-                    ref_logprob = torch.masked_fill(ref_logprob, padding_mask, INVALID_LOGPROB)
-                    sequence_length_plus_one = sequence_length + 1
-
-                    prev_ref_log_ratio = logprob - ref_logprob
-                    prev_ref_log_ratio = torch.masked_fill(
-                        prev_ref_log_ratio, padding_mask, 0
-                    )
-                    non_score_reward = -config.kl_coef * prev_ref_log_ratio
-
-                    reward = non_score_reward.clone()
-                    batch_indices = torch.arange(reward.size(0), device=reward.device)
-                    sequence_end_indices = torch.where(
-                        sequence_length_plus_one < reward.size(1),
-                        sequence_length_plus_one,
-                        sequence_length,
-                    )
-                    reward[[batch_indices, sequence_end_indices]] += score
-
-                    reward = torch.sum(reward, axis=1)
-                    prev_ref_log_ratio = torch.sum(prev_ref_log_ratio, axis=1)
-
-                    # Log metrics into pandas table
-
+                    table["query"].extend(decoded_query)
+                    table["model response"].extend(decoded_response)
                     table["score"].extend(
                         self.accelerator.gather(score).float().cpu().numpy()
                     )
