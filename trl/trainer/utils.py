@@ -997,9 +997,11 @@ class OnPolicyConfig(TrainingArguments):
             Truncation token id.
         response_truncation_sequences (`[List[List[int]]]`, *optional*, defaults to `None`):
             Stop strings for generations from the model.
-        temperature (`float`, *optional*, defaults to `0.7`):
+        train_temperature (`float`, *optional*, defaults to `1.0`):
+            Used to divide logits when training model.
+        train_rollout_temperature (`float`, *optional*, defaults to `1.0`):
             Sampling temperature.
-        eval_temperature (`float`, *optional*, defaults to `0.7`):
+        eval_rollout_temperature (`float`, *optional*, defaults to `1.0`):
             Sampling temperature for evaluation.
         missing_eos_penalty (`Optional[float]`, *optional*, defaults to `None`):
             Penalty applied to the score when the model fails to generate an EOS token. This is useful to encourage
@@ -1035,9 +1037,9 @@ class OnPolicyConfig(TrainingArguments):
     stop_token: Optional[Literal["eos"]] = None
     stop_token_id: Optional[int] = None
     response_truncation_sequences: Optional[List[List[int]]] = None
-    temperature: float = 1.0
-    eval_temperature: float = 1.0
-    ref_temperature: float = 1.0
+    train_temperature: float = 1.0
+    train_rollout_temperature: float = 1.0
+    eval_rollout_temperature: float = 1.0
     missing_eos_penalty: Optional[float] = None
     sft_model_path: str = "EleutherAI/pythia-160m"
     world_size: Optional[int] = None

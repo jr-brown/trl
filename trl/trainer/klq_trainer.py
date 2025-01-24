@@ -291,7 +291,7 @@ def micro_batch_updates(
                 model, micro_batch_query_responses, pad_token_id
             )
             logits = output.logits[:, context_length - 1 : -1]
-            logits /= config.temperature + 1e-7
+            logits /= config.train_temperature + 1e-7
             new_all_logprobs = F.log_softmax(logits, dim=-1)
             new_logprobs = torch.gather(
                 new_all_logprobs, 2, micro_batch_responses.unsqueeze(-1)
@@ -445,7 +445,7 @@ def klq_batch_update(
             stop_token_id=config.stop_token_id,
             response_truncation_sequences=config.response_truncation_sequences,
             local_rollout_forward_batch_size=config.local_rollout_forward_batch_size,
-            ref_temperature=config.ref_temperature,
+            ref_temperature=config.train_temperature,
             device=device,
         )
         action_values = config.kl_coef * (logprobs - ref_logprobs) + state_values

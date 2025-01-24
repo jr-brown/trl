@@ -445,7 +445,7 @@ class OnPolicyTrainer(ABC, Trainer):
 
         self.train_generation_config = GenerationConfig(
             max_new_tokens=config.response_length,
-            temperature=(config.temperature + 1e-7),
+            temperature=(config.train_rollout_temperature + 1e-7),
             top_k=0.0,
             top_p=1.0,
             do_sample=True,
@@ -453,7 +453,7 @@ class OnPolicyTrainer(ABC, Trainer):
 
         self.eval_generation_config = GenerationConfig(
             max_new_tokens=config.response_length,
-            temperature=(config.eval_temperature + 1e-7),
+            temperature=(config.eval_rollout_temperature + 1e-7),
             top_k=0.0,
             top_p=1.0,
             do_sample=True,
@@ -682,7 +682,7 @@ class OnPolicyTrainer(ABC, Trainer):
             response,
             processing_class.pad_token_id,
             context_length,
-            config.ref_temperature,
+            config.train_temperature,
         )
 
         sequence_length = first_true_indices(
