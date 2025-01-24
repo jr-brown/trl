@@ -487,7 +487,7 @@ class PPOTrainer(OnPolicyTrainer):
             optimizers=optimizers,
             callbacks=callbacks,
         )
-        assert config.train_temperature == config.train_rollout_temperature
+        assert config.train_temperature == config.train_rollout_temperature, "PPO does not support these being inequal."
 
     def _initialise_stats(self) -> PPOStats:
         stats_shape = (
