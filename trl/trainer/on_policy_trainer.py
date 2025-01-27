@@ -777,10 +777,12 @@ class OnPolicyTrainer(ABC, Trainer):
                 import wandb
 
                 if wandb.run is not None:
-                    wandb.log({"completions": wandb.Table(dataframe=df)})
-                    wandb.log({"eval/objective/traj/scores": df["score"].mean()})
-                    wandb.log({"eval/objective/traj/rlhf_reward": df["rlhf_reward"].mean()})
-                    wandb.log({"eval/policy/traj/prev_ref_log_ratio": df["prev_ref_log_ratio"].mean()})
+                    wandb.log({
+                        "completions": wandb.Table(dataframe=df),
+                        "eval/objective/traj/scores": df["score"].mean(),
+                        "eval/objective/traj/rlhf_reward": df["rlhf_reward"].mean(),
+                        "eval/policy/traj/prev_ref_log_ratio": df["prev_ref_log_ratio"].mean(),
+                    })
 
     def create_model_card(
         self,
