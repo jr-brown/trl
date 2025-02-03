@@ -634,7 +634,9 @@ class OnPolicyTrainer(ABC, Trainer):
                 config.num_sample_generations > 0
                 and (update - 1) % self.sample_generations_freq == 0
             ):
-                self.generate_eval_completions(max_num_batches=config.max_num_eval_batches)
+                self.generate_eval_completions(
+                    max_num_batches=config.max_num_eval_batches
+                )
                 torch.cuda.empty_cache()
 
             # Units are minutes for time_taken and time_limit
@@ -763,7 +765,7 @@ class OnPolicyTrainer(ABC, Trainer):
 
         return decoded_query, decoded_response, score, reward, prev_ref_log_ratio
 
-    def generate_eval_completions(self, max_num_batches: Optional[int]=None):
+    def generate_eval_completions(self, max_num_batches: Optional[int] = None):
         """
         Generate completions for the eval dataset and log the completions and their scores.
 
@@ -783,12 +785,12 @@ class OnPolicyTrainer(ABC, Trainer):
 
             batch_iter = (
                 enumerate(self.eval_dataloader)
-                if max_num_batches is None else
-                zip(range(max_num_batches), self.eval_dataloader)
+                if max_num_batches is None
+                else zip(range(max_num_batches), self.eval_dataloader)
             )
 
             for i, batch in batch_iter:
-                log.debug(f"Batch {i}, shape={batch["input_ids"].shape}")
+                log.debug(f"Batch {i}, shape={batch['input_ids'].shape}")
 
                 query = batch["input_ids"]
                 with torch.no_grad():
