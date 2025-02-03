@@ -603,7 +603,7 @@ class OnPolicyTrainer(ABC, Trainer):
                 config.num_sample_generations > 0
                 and (update - 1) % self.sample_generations_freq == 0
             ):
-                self.generate_eval_completions(sampling=True)
+                self.generate_eval_completions(max_num_batches=config.max_num_eval_batches)
                 torch.cuda.empty_cache()
 
             # Units are minutes for time_taken and time_limit
@@ -732,22 +732,33 @@ class OnPolicyTrainer(ABC, Trainer):
 
         return decoded_query, decoded_response, score, reward, prev_ref_log_ratio
 
-    def generate_eval_completions(self, sampling: bool = False):
+    def generate_eval_completions(self, max_num_batches: Optional[int] = None):
         """
         Generate completions for the eval dataset and log the completions and their scores.
 
         Args:
-            sampling (bool): When sampling is True, only a single batch of completions is generated. Otherwise, all completions are generated for the entire eval dataset.
+            max_num_batches (int | None): If specified, at most this many batches of completions are generated. Otherwise, all completions are generated for the entire eval dataset.
         """
         config = self.args
         processing_class = self.processing_class
         reward_model_processing_class = self.reward_model_processing_class
 
+        log.debug("Beginning Eval")
+
         table = defaultdict(list)
         with unwrap_model_for_generation(
             self.model, self.accelerator
         ) as unwrapped_model:
-            for batch in self.eval_dataloader:
+
+            batch_iter = (
+                enumerate(self.eval_dataloader)
+                if max_num_batches is None else
+                zip(range(max_num_batches), self.eval_dataloader)
+            )
+
+            for i, batch in batch_iter:
+                log.debug(f"Batch {i}, shape={batch["input_ids"].shape}")
+
                 query = batch["input_ids"]
                 with torch.no_grad():
                     (
@@ -780,13 +791,14 @@ class OnPolicyTrainer(ABC, Trainer):
                     torch.cuda.empty_cache()
                     gc.collect()
 
-                if sampling:
+                if i:
                     break
 
         df = pd.DataFrame(table)
 
         if self.accelerator.is_main_process:
-            print_rich_table(df.iloc[0 : 0 + 5])
+            log.debug(f"Eval table shape is {df.shape}, printing first 4 rows")
+            print_rich_table(df.iloc[0 : 0 + 4])
             if "wandb" in config.report_to:
                 import wandb
 

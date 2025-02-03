@@ -338,6 +338,8 @@ class OnPolicyConfig(TrainingArguments):
             Per rank no grad forward pass in the rollout phase.
         num_sample_generations (`int`, *optional*, defaults to `10`):
             Number of debugging samples generations (i.e., `generate_eval_completions` calls) throughout training.
+        max_num_eval_batches (`Optional[int]`, defaults to `1`):
+            Maximum number of batches to be used when sampling eval generations. If set to None, will iterate through the entire eval dataset.
         response_length (`int`, *optional*, defaults to `53`):
             Length of the response.
         stop_token (`Optional[str]`, *optional*, defaults to `None`):
@@ -382,6 +384,7 @@ class OnPolicyConfig(TrainingArguments):
     total_episodes: Optional[int] = None
     local_rollout_forward_batch_size: int = 64
     num_sample_generations: int = 10
+    max_num_eval_batches: Optional[int] = 1
     response_length: int = 53
     stop_token: Optional[Literal["eos"]] = None
     stop_token_id: Optional[int] = None
