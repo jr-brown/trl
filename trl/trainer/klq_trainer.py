@@ -529,7 +529,9 @@ def klq_batch_update(
         # Create the advantage estimates by reversing the GAE backward recursion
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         # Set the return estimates to be the advantage estimates
-        returns = advantages + action_values  # This used to be state_values
+        returns = (
+            config.alpha * advantages + action_values
+        )  # This used to be state_values
         returns = torch.masked_fill(returns, padding_mask_plus_one, 0)  # BUGHOTSPOT
 
         # Whiten the advantages. Note that this is *non-optional* and *done at the entire batch level*
