@@ -763,7 +763,7 @@ class OnPolicyTrainer(ABC, Trainer):
 
         return decoded_query, decoded_response, score, reward, prev_ref_log_ratio
 
-    def generate_eval_completions(self, sampling: bool = False):
+    def generate_eval_completions(self, max_num_batches: Optional[int]=None):
         """
         Generate completions for the eval dataset and log the completions and their scores.
 
