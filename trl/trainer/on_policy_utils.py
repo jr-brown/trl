@@ -1,6 +1,7 @@
 import torch
 import torch.utils.data
 import torch.nn.functional as F
+import numpy as np
 
 from typing import List, Literal, Optional
 from dataclasses import dataclass
@@ -25,7 +26,9 @@ def retokenize(
         return input_ids, source_processing_class.pad_token_id
 
     else:
-        decoded_batch = source_processing_class.batch_decode(input_ids, skip_special_tokens=True)
+        decoded_batch = source_processing_class.batch_decode(
+            input_ids, skip_special_tokens=True
+        )
         new_inputs = target_processing_class(
             decoded_batch,
             return_tensors="pt",
@@ -43,9 +46,7 @@ def get_just_value(
     lm_backbone = getattr(model, model.base_model_prefix)
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
 
-    position_ids = (
-        attention_mask.cumsum(1) - attention_mask.long()
-    )  # exclusive cumsum
+    position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     output = lm_backbone(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -122,6 +123,46 @@ def get_just_reward(
             torch.arange(full_rewards.size(0), device=full_rewards.device),
             last_non_pad_tkn_idxs,
         ]
+
+
+class ScheduledParameter:
+    def __init__(
+        self,
+        initial_value: float,
+        final_value: float,
+        batch_schedule_length: int,
+        schedule_type: str = "linear",
+    ):
+        self.initial_value = initial_value
+        self.final_value = final_value
+        self.batch_schedule_length = batch_schedule_length
+        assert schedule_type in [
+            "linear",
+            "cosine",
+        ], f"schedule_type must be 'linear' or 'cosine', got {schedule_type}"
+        self.schedule_type = schedule_type
+
+        self.current_step = 0
+        self.current_value = initial_value
+
+    def step(self) -> float:
+        self.current_step += 1
+        progress = min(self.current_step / self.batch_schedule_length, 1)
+        if self.schedule_type == "linear":
+            self.current_value = (
+                self.initial_value + (self.final_value - self.initial_value) * progress
+            )
+        elif self.schedule_type == "cosine":
+            self.current_value = self.final_value + 0.5 * (
+                self.initial_value - self.final_value
+            ) * (1 + torch.cos(progress * np.pi))
+        else:
+            raise ValueError(
+                f"schedule_type must be 'linear' or 'cosine', got {self.schedule_type}"
+            )
+
+    def get(self) -> float:
+        return self.current_value
 
 
 def calc_logprob(
@@ -403,4 +444,8 @@ class OnPolicyConfig(TrainingArguments):
     mini_batch_size: Optional[int] = None
     push_to_hub: bool = False
     time_limit_mins: Optional[float] = None
-
+    # Parameters
+    lam: float = 0.95
+    final_lam: Optional[float] = None
+    lam_episode_length: Optional[int] = None
+    lam_schedule_type: str = "linear"

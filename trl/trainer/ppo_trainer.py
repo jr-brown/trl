@@ -250,6 +250,8 @@ def ppo_batch_update(
     ppo_stats,
     # data for this batch
     data,
+    # Scheduled parameters
+    lam,
 ):
 
     start_time = time.perf_counter()
@@ -354,7 +356,7 @@ def ppo_batch_update(
             # Compute the TD-error
             delta = rewards[:, t] + config.gamma * nextvalues - state_values[:, t]
             # Use the GAE backwards recursion relationship
-            last_gae = delta + config.gamma * config.lam * last_gae
+            last_gae = delta + config.gamma * lam * last_gae
             advantages_reversed.append(last_gae)
 
         # Create the advantage estimates by reversing the GAE backward recursion
@@ -534,4 +536,6 @@ class PPOTrainer(OnPolicyTrainer):
             ppo_stats=self.stats,
             # data for this batch!
             data=data,
+            # Scheduled parameters
+            lam=self.lambda_scheduler.get(),
         )

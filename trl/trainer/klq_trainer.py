@@ -38,7 +38,7 @@ from ..trainer.utils import (
     forward,
 )
 from .klq_config import KLQConfig
-from .on_policy_utils import rollouts_to_loss_variables
+from .on_policy_utils import rollouts_to_loss_variables, ScheduledParameter
 from .on_policy_trainer import OnPolicyTrainer
 
 
@@ -411,6 +411,8 @@ def klq_batch_update(
     klq_stats: KLQStats,
     # data for the this batch!
     data: Dict[str, Tensor],
+    # Scheduled parameters
+    lam: float,
 ):
 
     start_time = time.perf_counter()
@@ -524,7 +526,7 @@ def klq_batch_update(
                 rewards[:, t] + config.gamma * next_state_values - action_values[:, t]
             )
             # Use the GAE backwards recursion relationship
-            last_gae = delta + config.gamma * config.lam * last_gae
+            last_gae = delta + config.gamma * lam * last_gae
             advantages_reversed.append(last_gae)
         # Create the advantage estimates by reversing the GAE backward recursion
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
@@ -708,4 +710,6 @@ class KLQTrainer(OnPolicyTrainer):
             klq_stats=self.stats,
             # data for this batch!
             data=data,
+            # Scheduled parameters
+            lam=self.lambda_scheduler.get(),
         )

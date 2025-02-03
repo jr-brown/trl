@@ -61,7 +61,13 @@ from ..trainer.utils import (
     truncate_response_from_sequences,
 )
 from .utils import generate_model_card
-from .on_policy_utils import get_just_reward, retokenize, calc_ref_logprob, OnPolicyConfig
+from .on_policy_utils import (
+    get_just_reward,
+    retokenize,
+    calc_ref_logprob,
+    OnPolicyConfig,
+    ScheduledParameter,
+)
 from ..trainer.utils import first_true_indices
 
 if is_wandb_available():
@@ -322,6 +328,22 @@ class OnPolicyTrainer(ABC, Trainer):
         config.num_total_batches = math.ceil(
             config.total_episodes / config.batch_size
         )  # we may train for more than `total_episodes`
+
+        config.final_lam = config.lam if config.final_lam is None else config.final_lam
+        batch_schedule_length = (
+            config.num_total_batches
+            if config.lam_episode_length is None
+            else config.lam_episode_length // config.batch_size
+        )
+
+        # Define the scheduler for the lambda parameter.
+        self.lambda_scheduler = ScheduledParameter(
+            initial_value=config.lam,
+            final_value=config.final_lam,
+            batch_schedule_length=batch_schedule_length,
+            schedule_type=config.lam_schedule_type,
+        )
+
         time_tensor = torch.tensor(int(time.time()), device=accelerator.device)
         time_int = broadcast(
             time_tensor, 0
@@ -581,6 +603,7 @@ class OnPolicyTrainer(ABC, Trainer):
             eps = int(self.state.episode / (time.time() - start_time))
             metrics["eps"] = eps
             metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
+            metrics["lambda"] = self.lambda_scheduler.get()
             metrics["episode"] = self.state.episode
             self.state.epoch = (
                 self.state.episode / self.train_dataset_len
@@ -588,6 +611,7 @@ class OnPolicyTrainer(ABC, Trainer):
             self.state.global_step += 1
             self.log(metrics)
             self.lr_scheduler.step()
+            self.lambda_scheduler.step()
             self.control = self.callback_handler.on_step_end(
                 config, self.state, self.control
             )

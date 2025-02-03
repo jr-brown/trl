@@ -42,7 +42,6 @@ class KLQConfig(OnPolicyConfig):
     whiten_rewards: bool = False
     kl_coef: float = 0.05
     gamma: float = 1.0
-    lam: float = 0.95
     alpha: float = 1.0
     loss_function: str = "l2_loss"
     loss_kwargs: Optional[dict] = None
