@@ -61,8 +61,8 @@ from ..trainer.utils import (
     truncate_response_from_sequences,
 )
 from .utils import generate_model_card
-from .on_policy_utils import get_just_reward, retokenize, calc_ref_logprob
-from ..trainer.utils import OnPolicyConfig, first_true_indices
+from .on_policy_utils import get_just_reward, retokenize, calc_ref_logprob, OnPolicyConfig
+from ..trainer.utils import first_true_indices
 
 if is_wandb_available():
     import wandb
