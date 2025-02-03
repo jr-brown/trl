@@ -14,6 +14,7 @@
 
 import gc
 from typing import Dict, List, Optional, Tuple, Union, Callable
+import time
 
 import numpy as np
 import torch
@@ -411,14 +412,17 @@ def klq_batch_update(
     # data for the this batch!
     data: Dict[str, Tensor],
 ):
+
+    start_time = time.perf_counter()
+
     with torch.no_grad():
         queries = data["input_ids"].to(device)
         context_length = queries.shape[1]
-
         with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
             # query_respones and logitss are both torch Tensors.
             # query_responses has shape [batch, query_length]
             # logitss has shape [batch, response_length, vocabulary size]
+
             query_responses, logitss = batch_generation(
                 unwrapped_model.policy,
                 queries,
@@ -426,6 +430,8 @@ def klq_batch_update(
                 processing_class.pad_token_id,
                 generation_config,
             )
+        generation_stop_time = time.perf_counter()
+        generation_time = generation_stop_time - start_time
         (
             responses,
             postprocessed_responses,
@@ -540,6 +546,8 @@ def klq_batch_update(
             advantages,
         )
         torch.cuda.empty_cache()
+    processing_stop_time = time.perf_counter()
+    processing_time = processing_stop_time - generation_stop_time
 
     # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
     # num_epochs_per_batch_update specifies how many times to loop over the PPO dataset.
@@ -575,6 +583,9 @@ def klq_batch_update(
                 stats=klq_stats,
             )
             torch.cuda.empty_cache()
+
+    training_stop_time = time.perf_counter()
+    training_time = training_stop_time - processing_stop_time
 
     # At the end of training, log a bunch of statistics in the metrics dictionary.
     with torch.no_grad():
@@ -617,6 +628,10 @@ def klq_batch_update(
         )
         metrics["loss/token/target_value"] = returns.mean().item()
         metrics["loss/token/target_value_var"] = returns.var().item()
+
+    metrics["time/iteration/generation"] = generation_time
+    metrics["time/iteration/processing"] = processing_time
+    metrics["time/iteration/training"] = training_time
 
     return metrics
 

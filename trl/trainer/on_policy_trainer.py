@@ -519,6 +519,10 @@ class OnPolicyTrainer(ABC, Trainer):
         self.accelerator.print("===training policy===")
         start_time = time.time()
 
+        total_generation_time = 0
+        total_processing_time = 0
+        total_training_time = 0
+
         # Set model to training mode (relevant for e.g. batch norm and dropout)
         self.model.train()
 
@@ -566,6 +570,13 @@ class OnPolicyTrainer(ABC, Trainer):
             # Main training function
             # (see implementations in child classes)
             metrics = self._batch_update(data=data)
+
+            total_generation_time += metrics["time/iteration/generation"]
+            total_processing_time += metrics["time/iteration/processing"]
+            total_training_time += metrics["time/iteration/training"]
+            metrics["time/total/generation"] = total_generation_time
+            metrics["time/total/processing"] = total_processing_time
+            metrics["time/total/training"] = total_training_time
 
             eps = int(self.state.episode / (time.time() - start_time))
             metrics["eps"] = eps
@@ -656,9 +667,7 @@ class OnPolicyTrainer(ABC, Trainer):
             processing_class.batch_decode(postprocessed_response)
         )
 
-        postprocessed_query_response = torch.cat(
-            (query, postprocessed_response), 1
-        )
+        postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
         reward_model_inputs, reward_model_pad_token = retokenize(
             postprocessed_query_response,
             self.accelerator.device,
@@ -685,9 +694,10 @@ class OnPolicyTrainer(ABC, Trainer):
             config.train_temperature,
         )
 
-        sequence_length = first_true_indices(
-            postprocessed_response == processing_class.pad_token_id
-        ) - 1
+        sequence_length = (
+            first_true_indices(postprocessed_response == processing_class.pad_token_id)
+            - 1
+        )
 
         contain_eos_token = torch.any(
             postprocessed_response == processing_class.eos_token_id,
@@ -696,18 +706,16 @@ class OnPolicyTrainer(ABC, Trainer):
         if config.missing_eos_penalty is not None:
             score[~contain_eos_token] -= config.missing_eos_penalty
 
-        response_idx = torch.arange(
-            response.shape[1], device=response.device
-        ).repeat(response.shape[0], 1)
+        response_idx = torch.arange(response.shape[1], device=response.device).repeat(
+            response.shape[0], 1
+        )
         padding_mask = response_idx > sequence_length.unsqueeze(1)
         logprob = torch.masked_fill(logprob, padding_mask, INVALID_LOGPROB)
         ref_logprob = torch.masked_fill(ref_logprob, padding_mask, INVALID_LOGPROB)
         sequence_length_plus_one = sequence_length + 1
 
         prev_ref_log_ratio = logprob - ref_logprob
-        prev_ref_log_ratio = torch.masked_fill(
-            prev_ref_log_ratio, padding_mask, 0
-        )
+        prev_ref_log_ratio = torch.masked_fill(prev_ref_log_ratio, padding_mask, 0)
         non_score_reward = -config.kl_coef * prev_ref_log_ratio
 
         reward = non_score_reward.clone()
@@ -723,7 +731,6 @@ class OnPolicyTrainer(ABC, Trainer):
         prev_ref_log_ratio = torch.sum(prev_ref_log_ratio, axis=1)
 
         return decoded_query, decoded_response, score, reward, prev_ref_log_ratio
-
 
     def generate_eval_completions(self, sampling: bool = False):
         """
@@ -744,7 +751,11 @@ class OnPolicyTrainer(ABC, Trainer):
                 query = batch["input_ids"]
                 with torch.no_grad():
                     (
-                        decoded_query, decoded_response, score, reward, prev_ref_log_ratio
+                        decoded_query,
+                        decoded_response,
+                        score,
+                        reward,
+                        prev_ref_log_ratio,
                     ) = self._eval_completions_inner(
                         config=config,
                         unwrapped_model=unwrapped_model,
@@ -761,7 +772,10 @@ class OnPolicyTrainer(ABC, Trainer):
                         self.accelerator.gather(reward).float().cpu().numpy()
                     )
                     table["prev_ref_log_ratio"].extend(
-                        self.accelerator.gather(prev_ref_log_ratio).float().cpu().numpy()
+                        self.accelerator.gather(prev_ref_log_ratio)
+                        .float()
+                        .cpu()
+                        .numpy()
                     )
                     torch.cuda.empty_cache()
                     gc.collect()
@@ -777,12 +791,16 @@ class OnPolicyTrainer(ABC, Trainer):
                 import wandb
 
                 if wandb.run is not None:
-                    wandb.log({
-                        "completions": wandb.Table(dataframe=df),
-                        "eval/objective/traj/scores": df["score"].mean(),
-                        "eval/objective/traj/rlhf_reward": df["rlhf_reward"].mean(),
-                        "eval/policy/traj/prev_ref_log_ratio": df["prev_ref_log_ratio"].mean(),
-                    })
+                    wandb.log(
+                        {
+                            "completions": wandb.Table(dataframe=df),
+                            "eval/objective/traj/scores": df["score"].mean(),
+                            "eval/objective/traj/rlhf_reward": df["rlhf_reward"].mean(),
+                            "eval/policy/traj/prev_ref_log_ratio": df[
+                                "prev_ref_log_ratio"
+                            ].mean(),
+                        }
+                    )
 
     def create_model_card(
         self,
