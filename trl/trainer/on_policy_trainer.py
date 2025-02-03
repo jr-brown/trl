@@ -61,8 +61,14 @@ from ..trainer.utils import (
     truncate_response_from_sequences,
 )
 from .utils import generate_model_card
-from .on_policy_utils import get_just_reward, retokenize, calc_ref_logprob
-from ..trainer.utils import OnPolicyConfig, first_true_indices
+from .on_policy_utils import (
+    get_just_reward,
+    retokenize,
+    calc_ref_logprob,
+    OnPolicyConfig,
+    ScheduledParameter,
+)
+from ..trainer.utils import first_true_indices
 
 if is_wandb_available():
     import wandb
@@ -144,6 +150,11 @@ class OnPolicyTrainer(ABC, Trainer):
             However, when accelerator is called, the number of gradient accumulation steps is set to config.gradient_accumulation_steps.
             Otherwise the naming convention seems quite strange.
 
+
+
+        BATCH-SIZE-DETERMINING ARGUMENTS
+        PRIMITIVE QUANTITIES
+
         - `config.world_size`
             * The number of processes we're using.
             * This is *primative*, in the sense that it is not derived from other quantities.
@@ -168,6 +179,9 @@ class OnPolicyTrainer(ABC, Trainer):
             * This is the number of mini-batches to accumulate gradients over before updating the model.
             * This is a *primative* quantity
             * For most purposes we can treat this as fixed at 1.
+
+
+        DERIVED QUANTITIES
 
         - `config.local_batch_size`
             * This is the number of rollouts for each process at every outer loop of the algorithm.
@@ -198,7 +212,8 @@ class OnPolicyTrainer(ABC, Trainer):
                 batch_size / num_mini_batches
             * This is equivalent to:
                 local_mini_batch_size * world_size
-            * This is not used for anything.
+            * This is not later in the codebase.
+            * However, it is interpretable: as the number of samples seen per gradient update step
 
         - `config.num_total_batches`
             * This is the number of outer iteration loops for the algorithm.
@@ -290,9 +305,7 @@ class OnPolicyTrainer(ABC, Trainer):
 
         # The number of processes we're using
         config.world_size = accelerator.num_processes
-        # per_device_train_batch_size
-        # gradient_accumulation_steps
-        # num_mini_batches
+
         config.local_batch_size = (
             config.per_device_train_batch_size
             * config.gradient_accumulation_steps
@@ -322,6 +335,22 @@ class OnPolicyTrainer(ABC, Trainer):
         config.num_total_batches = math.ceil(
             config.total_episodes / config.batch_size
         )  # we may train for more than `total_episodes`
+
+        config.final_lam = config.lam if config.final_lam is None else config.final_lam
+        batch_schedule_length = (
+            config.num_total_batches
+            if config.lam_episode_length is None
+            else config.lam_episode_length // config.batch_size
+        )
+
+        # Define the scheduler for the lambda parameter.
+        self.lambda_scheduler = ScheduledParameter(
+            initial_value=config.lam,
+            final_value=config.final_lam,
+            batch_schedule_length=batch_schedule_length,
+            schedule_type=config.lam_schedule_type,
+        )
+
         time_tensor = torch.tensor(int(time.time()), device=accelerator.device)
         time_int = broadcast(
             time_tensor, 0
@@ -519,6 +548,10 @@ class OnPolicyTrainer(ABC, Trainer):
         self.accelerator.print("===training policy===")
         start_time = time.time()
 
+        total_generation_time = 0
+        total_processing_time = 0
+        total_training_time = 0
+
         # Set model to training mode (relevant for e.g. batch norm and dropout)
         self.model.train()
 
@@ -567,9 +600,17 @@ class OnPolicyTrainer(ABC, Trainer):
             # (see implementations in child classes)
             metrics = self._batch_update(data=data)
 
+            total_generation_time += metrics["time/iteration/generation"]
+            total_processing_time += metrics["time/iteration/processing"]
+            total_training_time += metrics["time/iteration/training"]
+            metrics["time/total/generation"] = total_generation_time
+            metrics["time/total/processing"] = total_processing_time
+            metrics["time/total/training"] = total_training_time
+
             eps = int(self.state.episode / (time.time() - start_time))
             metrics["eps"] = eps
             metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
+            metrics["lambda"] = self.lambda_scheduler.get()
             metrics["episode"] = self.state.episode
             self.state.epoch = (
                 self.state.episode / self.train_dataset_len
@@ -577,6 +618,7 @@ class OnPolicyTrainer(ABC, Trainer):
             self.state.global_step += 1
             self.log(metrics)
             self.lr_scheduler.step()
+            self.lambda_scheduler.step()
             self.control = self.callback_handler.on_step_end(
                 config, self.state, self.control
             )
@@ -592,7 +634,7 @@ class OnPolicyTrainer(ABC, Trainer):
                 config.num_sample_generations > 0
                 and (update - 1) % self.sample_generations_freq == 0
             ):
-                self.generate_eval_completions(sampling=True)
+                self.generate_eval_completions(max_num_batches=config.max_num_eval_batches)
                 torch.cuda.empty_cache()
 
             # Units are minutes for time_taken and time_limit
@@ -726,17 +768,28 @@ class OnPolicyTrainer(ABC, Trainer):
         Generate completions for the eval dataset and log the completions and their scores.
 
         Args:
-            sampling (bool): When sampling is True, only a single batch of completions is generated. Otherwise, all completions are generated for the entire eval dataset.
+            max_num_batches (int | None): If specified, at most this many batches of completions are generated. Otherwise, all completions are generated for the entire eval dataset.
         """
         config = self.args
         processing_class = self.processing_class
         reward_model_processing_class = self.reward_model_processing_class
 
+        log.debug("Beginning Eval")
+
         table = defaultdict(list)
         with unwrap_model_for_generation(
             self.model, self.accelerator
         ) as unwrapped_model:
-            for batch in self.eval_dataloader:
+
+            batch_iter = (
+                enumerate(self.eval_dataloader)
+                if max_num_batches is None else
+                zip(range(max_num_batches), self.eval_dataloader)
+            )
+
+            for i, batch in batch_iter:
+                log.debug(f"Batch {i}, shape={batch["input_ids"].shape}")
+
                 query = batch["input_ids"]
                 with torch.no_grad():
                     (
@@ -769,13 +822,11 @@ class OnPolicyTrainer(ABC, Trainer):
                     torch.cuda.empty_cache()
                     gc.collect()
 
-                if sampling:
-                    break
-
         df = pd.DataFrame(table)
 
         if self.accelerator.is_main_process:
-            print_rich_table(df.iloc[0 : 0 + 5])
+            log.debug(f"Eval table shape is {df.shape}, printing first 4 rows")
+            print_rich_table(df.iloc[0 : 0 + 4])
             if "wandb" in config.report_to:
                 import wandb
 

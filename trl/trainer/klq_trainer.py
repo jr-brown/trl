@@ -14,6 +14,7 @@
 
 import gc
 from typing import Dict, List, Optional, Tuple, Union, Callable
+import time
 
 import numpy as np
 import torch
@@ -37,7 +38,7 @@ from ..trainer.utils import (
     forward,
 )
 from .klq_config import KLQConfig
-from .on_policy_utils import rollouts_to_loss_variables
+from .on_policy_utils import rollouts_to_loss_variables, ScheduledParameter
 from .on_policy_trainer import OnPolicyTrainer
 
 
@@ -410,15 +411,20 @@ def klq_batch_update(
     klq_stats: KLQStats,
     # data for the this batch!
     data: Dict[str, Tensor],
+    # Scheduled parameters
+    lam: float,
 ):
+
+    start_time = time.perf_counter()
+
     with torch.no_grad():
         queries = data["input_ids"].to(device)
         context_length = queries.shape[1]
-
         with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
             # query_respones and logitss are both torch Tensors.
             # query_responses has shape [batch, query_length]
             # logitss has shape [batch, response_length, vocabulary size]
+
             query_responses, logitss = batch_generation(
                 unwrapped_model.policy,
                 queries,
@@ -426,6 +432,8 @@ def klq_batch_update(
                 processing_class.pad_token_id,
                 generation_config,
             )
+        generation_stop_time = time.perf_counter()
+        generation_time = generation_stop_time - start_time
         (
             responses,
             postprocessed_responses,
@@ -518,12 +526,14 @@ def klq_batch_update(
                 rewards[:, t] + config.gamma * next_state_values - action_values[:, t]
             )
             # Use the GAE backwards recursion relationship
-            last_gae = delta + config.gamma * config.lam * last_gae
+            last_gae = delta + config.gamma * lam * last_gae
             advantages_reversed.append(last_gae)
         # Create the advantage estimates by reversing the GAE backward recursion
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         # Set the return estimates to be the advantage estimates
-        returns = advantages + action_values  # This used to be state_values
+        returns = (
+            config.alpha * advantages + action_values
+        )  # This used to be state_values
         returns = torch.masked_fill(returns, padding_mask_plus_one, 0)  # BUGHOTSPOT
 
         # Whiten the advantages. Note that this is *non-optional* and *done at the entire batch level*
@@ -540,6 +550,8 @@ def klq_batch_update(
             advantages,
         )
         torch.cuda.empty_cache()
+    processing_stop_time = time.perf_counter()
+    processing_time = processing_stop_time - generation_stop_time
 
     # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
     # num_epochs_per_batch_update specifies how many times to loop over the PPO dataset.
@@ -575,6 +587,9 @@ def klq_batch_update(
                 stats=klq_stats,
             )
             torch.cuda.empty_cache()
+
+    training_stop_time = time.perf_counter()
+    training_time = training_stop_time - processing_stop_time
 
     # At the end of training, log a bunch of statistics in the metrics dictionary.
     with torch.no_grad():
@@ -617,6 +632,10 @@ def klq_batch_update(
         )
         metrics["loss/token/target_value"] = returns.mean().item()
         metrics["loss/token/target_value_var"] = returns.var().item()
+
+    metrics["time/iteration/generation"] = generation_time
+    metrics["time/iteration/processing"] = processing_time
+    metrics["time/iteration/training"] = training_time
 
     return metrics
 
@@ -691,4 +710,6 @@ class KLQTrainer(OnPolicyTrainer):
             klq_stats=self.stats,
             # data for this batch!
             data=data,
+            # Scheduled parameters
+            lam=self.lambda_scheduler.get(),
         )

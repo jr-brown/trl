@@ -15,7 +15,7 @@
 import os
 from dataclasses import dataclass
 
-from ..trainer.utils import OnPolicyConfig
+from ..trainer.on_policy_utils import OnPolicyConfig
 
 
 @dataclass

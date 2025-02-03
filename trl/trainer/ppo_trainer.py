@@ -14,6 +14,7 @@
 
 import gc
 from typing import Dict, List, Optional, Tuple, Union
+import time
 
 import numpy as np
 import torch
@@ -249,7 +250,12 @@ def ppo_batch_update(
     ppo_stats,
     # data for this batch
     data,
+    # Scheduled parameters
+    lam,
 ):
+
+    start_time = time.perf_counter()
+
     # Generate a PPO dataset for this update phase
     with torch.no_grad():
         queries = data["input_ids"].to(device)
@@ -266,7 +272,8 @@ def ppo_batch_update(
                 processing_class.pad_token_id,
                 generation_config,
             )
-
+        generation_stop_time = time.perf_counter()
+        generation_time = generation_stop_time - start_time
         (
             responses,
             postprocessed_responses,
@@ -349,7 +356,7 @@ def ppo_batch_update(
             # Compute the TD-error
             delta = rewards[:, t] + config.gamma * nextvalues - state_values[:, t]
             # Use the GAE backwards recursion relationship
-            last_gae = delta + config.gamma * config.lam * last_gae
+            last_gae = delta + config.gamma * lam * last_gae
             advantages_reversed.append(last_gae)
 
         # Create the advantage estimates by reversing the GAE backward recursion
@@ -360,6 +367,8 @@ def ppo_batch_update(
         advantages = masked_whiten(advantages, ~padding_mask)
         advantages = torch.masked_fill(advantages, padding_mask, 0)
         torch.cuda.empty_cache()
+    processing_stop_time = time.perf_counter()
+    processing_time = processing_stop_time - generation_stop_time
 
     # Do multiple epochs of PPO training, using the dataset for this update phase
     # use a fresh random shuffle in each epoch
@@ -396,6 +405,9 @@ def ppo_batch_update(
                 stats=ppo_stats,
             )
             torch.cuda.empty_cache()
+
+    training_stop_time = time.perf_counter()
+    training_time = training_stop_time - processing_stop_time
 
     # At the end of the update phase, log a bunch of statistics in the metrics dictionary.
     with torch.no_grad():
@@ -444,6 +456,10 @@ def ppo_batch_update(
             (responses == processing_class.eos_token_id).sum().item()
         )
 
+    metrics["time/iteration/generation"] = generation_time
+    metrics["time/iteration/processing"] = processing_time
+    metrics["time/iteration/training"] = training_time
+
     return metrics
 
 
@@ -487,7 +503,9 @@ class PPOTrainer(OnPolicyTrainer):
             optimizers=optimizers,
             callbacks=callbacks,
         )
-        assert config.train_temperature == config.train_rollout_temperature, "PPO does not support these being inequal."
+        assert (
+            config.train_temperature == config.train_rollout_temperature
+        ), "PPO does not support these being inequal."
 
     def _initialise_stats(self) -> PPOStats:
         stats_shape = (
@@ -518,4 +536,6 @@ class PPOTrainer(OnPolicyTrainer):
             ppo_stats=self.stats,
             # data for this batch!
             data=data,
+            # Scheduled parameters
+            lam=self.lambda_scheduler.get(),
         )
