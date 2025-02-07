@@ -210,6 +210,7 @@ class KLQStats:
     def __init__(self, stats_shape: Tuple[int, int, int], device: torch.device) -> None:
         self.loss_function_stats = torch.zeros(stats_shape, device=device)
         self.action_value_stats = torch.zeros(stats_shape, device=device)
+        self.state_value_error_stats = torch.zeros(stats_shape, device=device)
         self.state_value_stats = torch.zeros(stats_shape, device=device)
         self.advantage_stats = torch.zeros(stats_shape, device=device)
         # self.log_ratio_new_ref_stats = torch.zeros(stats_shape, device=device)
@@ -224,6 +225,7 @@ class KLQStats:
         update_location: Tuple[int, int, int],
         action_value_function_loss,
         action_value_prediction,
+        state_value_error,
         state_value_prediction,
         # new_ref_log_ratio,
         entropy,
@@ -234,6 +236,7 @@ class KLQStats:
     ):
         self.loss_function_stats[update_location] = action_value_function_loss
         self.action_value_stats[update_location] = action_value_prediction
+        self.state_value_error_stats[update_location] = state_value_error
         self.state_value_stats[update_location] = state_value_prediction
         self.advantage_stats[update_location] = (
             action_value_prediction - state_value_prediction
@@ -342,6 +345,11 @@ def micro_batch_updates(
             action_value_function_loss = masked_mean(
                 action_value_function_losses, ~padding_mask_plus_one[micro_batch_inds]
             )
+
+            # Compute state_value error for logging
+            state_value_errors = torch.square(state_value_prediction - micro_batch_return)
+            state_value_error = masked_mean(state_value_errors, ~padding_mask[micro_batch_inds])
+
             # Perform the update step.
             accelerator.backward(action_value_function_loss)
             optimizer.step()
@@ -383,6 +391,7 @@ def micro_batch_updates(
                     update_location,
                     action_value_function_loss=action_value_function_loss,
                     action_value_prediction=mean_action_value_prediction,
+                    state_value_error=state_value_error,
                     state_value_prediction=mean_state_value_prediction,
                     # new_ref_log_ratio=new_ref_log_ratio.sum(1).mean(),
                     entropy=avg_entropy,
@@ -620,6 +629,7 @@ def klq_batch_update(
             "loss/token/action_value_loss": s.loss_function_stats,
             #
             "value_function/token/state_value": s.state_value_stats,
+            "value_function/token/state_value_error": s.state_value_error_stats,
             "value_function/token/action_value": s.action_value_stats,
             "value_function/token/advantage": s.advantage_stats,
         }
