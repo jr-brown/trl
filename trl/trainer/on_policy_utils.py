@@ -14,6 +14,8 @@ from ..trainer.utils import (
     truncate_response_from_sequences,
 )
 
+INVALID_LOGPROB = 1.0
+
 
 def retokenize(
     input_ids: torch.Tensor,
@@ -204,6 +206,51 @@ def calc_ref_logprob(
         )
 
     return ref_logprob
+
+
+def forward_pass_on_rollouts(
+    config,
+    model,
+    queries,
+    query_responses,
+    local_rollout_forward_batch_size,
+    context_length,  # query context length or something
+    pad_token_id,
+    padding_mask,
+    padding_mask_plus_one,
+):
+    """L&E constructed this by lifting code from klq_micro_batch_updates.
+    And then combining with on_policy_utils/calc_ref_logprob.
+
+    For now this is 'written', but expect many bugs."""
+    for i in range(0, queries.shape[0], local_rollout_forward_batch_size):
+        local_rollout_indices = slice(i, i + local_rollout_forward_batch_size)
+        query = queries[local_rollout_indices]
+        query_response = query_response[local_rollout_indices]
+        response = query_response[:, context_length:]
+        # note: might be able to pass in the responses directly
+
+        # Extract the query
+        output, state_value_prediction_temporary = forward(
+            model, query_response, pad_token_id
+        )
+        logits = output.logits[:, context_length - 1 : -1]
+        logits /= config.train_temperature + 1e-7
+        new_all_logprobs = F.log_softmax(logits, dim=-1)
+        new_logprobs = torch.gather(
+            new_all_logprobs, 2, response.unsqueeze(-1)
+        ).squeeze(-1)
+        new_logprobs = torch.masked_fill(
+            new_logprobs, padding_mask[local_rollout_indices], INVALID_LOGPROB
+        )
+
+        # Compute inputs to loss function
+        state_value_prediction = state_value_prediction_temporary[
+            :, context_length - 1 : -1
+        ].squeeze(-1)
+        state_value_prediction = torch.masked_fill(
+            state_value_prediction, padding_mask_plus_one[local_rollout_indices], 0
+        )
 
 
 def rollouts_to_loss_variables(
