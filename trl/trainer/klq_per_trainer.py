@@ -55,10 +55,19 @@ ProcessingClass = PreTrainedTokenizerBase
 
 @dataclass
 class KLQPERConfig(KLQConfig):
-    """Config for KLQ with Prioritised Experience Replay."""
+    """Config for KLQ with Prioritised Experience Replay.
 
-    replay_buffer_size: int = 1_000
+    Note:
+        The replay number is equal to the replay rate times the local batch size.
+        The learning_starts parameters should *always* be greater than the replay number.
+    """
+
+    local_replay_buffer_capacity: int = 250
     replay_rate: float = 0.5
+    local_learning_starts: int = 100
+    retrace: bool = True
+    retrace_clip: float = 1.0
+    expert_retrace_clip: float = 0.95
 
 
 # New code at top of file
@@ -69,22 +78,31 @@ def prioritise_batch(
     lam,
     ref_logprobs,
     new_logprobs,
+    gen_logprobs,
     rewards,
     padding_mask_plus_one,
 ):
     """Take in the batch that we have trained on, and the current policy.
     Run a forward pass to recompute the Deltas.
+    Deltas are computed using the backwards recursion relationship for retrace(\lambda) if config.retrace is True.
+    Else, we use the Q^*(\lambda) estimator.
     From Deltas recompute priorities.
+    Currently priorities are computed using the mean square of the Deltas.
     Specifically, need to take in: x (query), y (completion), reference probabilities (to obtain Q from policy),
     behavioural probabilities, and reward model scores.
 
     Only need logprobs and state_values
-
-    TODO: correct the errors in this function definition.
     """
     # Initial cheap computation to get action values
     action_values = config.kl_coef * (new_logprobs - ref_logprobs) + state_values
     action_values = torch.masked_fill(action_values, padding_mask_plus_one, 0)
+
+    if config.retrace:
+        traces = torch.clamp(
+            torch.exp(new_logprobs - gen_logprobs), max=config.retrace_clip
+        )
+    else:
+        traces = torch.ones_like(new_logprobs)
 
     last_Delta = 0
     Deltas_reversed = []
@@ -92,10 +110,13 @@ def prioritise_batch(
     for t in reversed(range(gen_length)):
         # Extract the next token state-values
         next_state_values = state_values[:, t + 1] if t < gen_length - 1 else 0.0
+        trace = (
+            traces[:, t + 1] if t < gen_length - 1 else 1.0
+        )  # BUGHOTSPOT - Edward: I'm pretty sure this is correct but it could be t instead of t + 1
         # Compute the TD-error
         delta = rewards[:, t] + config.gamma * next_state_values - action_values[:, t]
-        # Use the GAE backwards recursion relationship
-        last_Delta = delta + config.gamma * lam * last_Delta
+        # Use the retrace backwards recursion relationship
+        last_Delta = delta + config.gamma * lam * trace * last_Delta
         Deltas_reversed.append(last_Delta)
     # Create the Delta estimates by reversing the lambda-return backward recursion
     Deltas = torch.stack(Deltas_reversed[::-1], dim=1)
@@ -118,16 +139,17 @@ class PERBuffer:
     def __init__(
         self,
         capacity: int,
-        config: OnPolicyConfig,
-        context_length: int,
+        query_length: int,
+        response_length: int,
         vocab_size: int,
     ):
         self.capacity = capacity
         self.row_available = torch.ones(capacity, dtype=torch.bool)
-        qr_length = context_length + config.response_length
+        qr_length = query_length + response_length
         self.query_responses = torch.zeros((capacity, qr_length))
         self.ref_logprobs = torch.zeros((capacity, qr_length, vocab_size))
         self.gen_logprobs = torch.zeros((capacity, qr_length, vocab_size))
+        self.rewards = torch.zeros((capacity, qr_length))
         self.returns = torch.zeros((capacity, qr_length))
         self.priorities = torch.zeros(capacity)
         self.padding_mask = torch.zeros((capacity, qr_length), dtype=torch.bool)
@@ -145,6 +167,7 @@ class PERBuffer:
         query_responses,
         ref_logprobs,
         gen_logprobs,
+        rewards,
         returns,
         priorities,
         padding_mask,
@@ -162,6 +185,7 @@ class PERBuffer:
         self.query_responses[idxs_to_write] = query_responses
         self.ref_logprobs[idxs_to_write] = ref_logprobs
         self.gen_logprobs[idxs_to_write] = gen_logprobs
+        self.rewards[idxs_to_write] = rewards
         self.returns[idxs_to_write] = returns
         self.priorities[idxs_to_write] = priorities
         self.padding_mask[idxs_to_write] = padding_mask
@@ -171,9 +195,11 @@ class PERBuffer:
     def pop_batch(self, pop_batch_size: int):
         """Extracts the samples with highest priority from the buffer."""
         idxs_to_pop = torch.argsort(self.priorities, descending=True)[:pop_batch_size]
+        # TODO: Implement sampling with probabilities proportional to priority to the alpha.
         query_responses = self.query_responses[idxs_to_pop]
         ref_logprobs = self.ref_logprobs[idxs_to_pop]
         gen_logprobs = self.gen_logprobs[idxs_to_pop]
+        rewards = self.rewards[idxs_to_pop]
         returns = self.returns[idxs_to_pop]
         priorities = self.priorities[idxs_to_pop]
         padding_mask = self.padding_mask[idxs_to_pop]
@@ -183,6 +209,7 @@ class PERBuffer:
             query_responses,
             ref_logprobs,
             gen_logprobs,
+            rewards,
             returns,
             priorities,
             padding_mask,
@@ -270,7 +297,13 @@ def klq_per_micro_batch_updates(
             # Retrieve the relevant variables for this microbatch
             micro_batch_responses = responses[micro_batch_inds]
             micro_batch_query_responses = query_responses[micro_batch_inds]
+
+            # WARNING: This is not actually the log probabilities for the previous policy.
+            # Instead, at present it is the generative log probabilities.
+            # This is equal to the prev log probs for the samples generated from rollouts.
+            # However, it is not equal to the prev log probs for the samples from the buffer.
             micro_batch_prev_logprobs = logprobs[micro_batch_inds]
+
             micro_batch_ref_logprobs = ref_logprobs[micro_batch_inds]
             micro_batch_return = returns[micro_batch_inds]
             micro_batch_prev_state_values = state_values[micro_batch_inds]
@@ -357,7 +390,7 @@ def klq_per_micro_batch_updates(
                 )
                 prev_ref_log_ratio = torch.masked_fill(
                     prev_ref_log_ratio, padding_mask[micro_batch_inds], 0
-                )
+                )  # NOTE: This computation is not meaningful at the moment, owing to the conflation of prev log probs with gen log probs.
                 # new_prev_log_ratio = -prev_new_log_ratio
                 # new_prev_ratio = torch.exp(new_prev_log_ratio)
 
@@ -373,9 +406,13 @@ def klq_per_micro_batch_updates(
                     state_value_prediction=mean_state_value_prediction,
                     # new_ref_log_ratio=new_ref_log_ratio.sum(1).mean(),
                     entropy=avg_entropy,
-                    prev_ref_log_ratio=prev_ref_log_ratio.sum(1).mean(),
+                    prev_ref_log_ratio=prev_ref_log_ratio.sum(
+                        1
+                    ).mean(),  # WARNING: not meaningful at the moment
                     # kl_new_ref=(new_prev_ratio * new_ref_log_ratio).sum(1).mean(),
-                    prev_new_log_ratio=prev_new_log_ratio.sum(1).mean(),
+                    prev_new_log_ratio=prev_new_log_ratio.sum(
+                        1
+                    ).mean(),  # WARNING: not meaningful at the moment
                     # kl_new_prev=(new_prev_ratio * new_prev_log_ratio).sum(1).mean(),
                 )
         gradient_accumulation_idx += 1
@@ -383,8 +420,7 @@ def klq_per_micro_batch_updates(
 
 
 def klq_per_batch_update(
-    buffer: PERBuffer,
-    config: KLQConfig,
+    config: KLQPERConfig,
     generation_config,
     processing_class,
     reward_model_processing_class,
@@ -398,7 +434,10 @@ def klq_per_batch_update(
     reward_model,
     klq_stats: KLQPERStats,
     # data for the this batch!
-    data: Dict[str, Tensor],
+    buffer: PERBuffer,
+    data: Dict[
+        str, Tensor
+    ],  # Need to change this to the dataloader so that we can draw arbitrary samples from the loader.
     # Scheduled parameters
     lam: float,
 ):
@@ -406,15 +445,36 @@ def klq_per_batch_update(
     start_time = time.perf_counter()
 
     ### PER-NEW ->
-    # When the buffer is empty we want to draw entirely from new samples.
-    # Provisional approach: generate a full batch-worth of new queries, but only keep as many as we will need
-    samples_to_pop = min(config.local_batch_size, buffer.num_samples)
-    num_queries_to_rollout = config.local_batch_size
+    """
+    When the number of samples in the buffer exceeds the learning starts, we draw
+    replay_rate * local_batch_size samples from the buffer. 
+    These are then combined with the samples generated from rollouts to form the training batch.
+    """
+    per_training = False
+
+    if buffer.num_samples >= config.local_learning_starts:
+        per_training = True
+        replay_number = int(config.replay_rate * config.local_batch_size)
+        assert replay_number <= buffer.num_samples, "Not enough samples in buffer."
+        (
+            replayed_query_responses,
+            replayed_ref_logprobs,
+            replayed_gen_logprobs,
+            replayed_rewards,
+            replayed_returns,
+            replayed_priorities,
+            replayed_padding_mask,
+            replayed_padding_mask_plus_one,
+        ) = buffer.pop_batch(replay_number)
 
     ### PER-NEW <-
 
     with torch.no_grad():
         queries = data["input_ids"].to(device)
+        if per_training:
+            rollout_number = config.local_batch_size - replay_number
+            queries = queries[:rollout_number]
+
         context_length = queries.shape[1]
         with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
             # query_respones and logitss are both torch Tensors.
@@ -530,9 +590,8 @@ def klq_per_batch_update(
         returns = config.alpha * Deltas + action_values  # This used to be state_values
         returns = torch.masked_fill(returns, padding_mask_plus_one, 0)  # BUGHOTSPOT
 
-        # We only want the returns, so delete all other variables.
+        # We only want the returns and the rewards, so delete all other variables.
         del (
-            rewards,
             last_Delta,
             Deltas_reversed,
             delta,
@@ -543,8 +602,21 @@ def klq_per_batch_update(
     processing_stop_time = time.perf_counter()
     processing_time = processing_stop_time - generation_stop_time
 
-    ### PER-NEW
+    ### PER-NEW ->
     # Combine the samples from the rollout with samples from the buffer
+
+    if per_training:
+        query_responses = torch.cat([query_responses, replayed_query_responses], dim=0)
+        ref_logprobs = torch.cat([ref_logprobs, replayed_ref_logprobs], dim=0)
+        gen_logprobs = torch.cat([logprobs, replayed_gen_logprobs], dim=0)
+        rewards = torch.cat([rewards, replayed_rewards], dim=0)
+        returns = torch.cat([returns, replayed_returns], dim=0)
+        padding_mask = torch.cat([padding_mask, replayed_padding_mask], dim=0)
+        padding_mask_plus_one = torch.cat(
+            [padding_mask_plus_one, replayed_padding_mask_plus_one], dim=0
+        )
+
+    ### PER-NEW <-
 
     # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
     # num_epochs_per_batch_update specifies how many times to loop over the PPO dataset.
@@ -567,7 +639,7 @@ def klq_per_batch_update(
                 batch_inds=batch_inds,
                 responses=responses,
                 query_responses=query_responses,
-                logprobs=logprobs,
+                logprobs=gen_logprobs,  # WARNING:
                 ref_logprobs=ref_logprobs,
                 returns=returns,
                 state_values=state_values,
@@ -581,39 +653,41 @@ def klq_per_batch_update(
             )
             torch.cuda.empty_cache()
 
-    # Recompute Deltas here
-    # TODO: review!
-    # do a whole forward pass with new weights
+    # We recompute the Deltas and returns here
+
     with torch.no_grad():
-        new_logprobs, state_value_predictions = forward_pass_on_rollouts(
-            config,
-            model,
-            query_responses,
-            config.local_rollout_forward_batch_size,
-            context_length,
-            processing_class.pad_token_id,
-            padding_mask,
-            padding_mask_plus_one,
-            ref_logprobs,
+        # Do a whole forward pass with new weights to get the new logprobs and state values.
+        new_logprobs, state_values = forward_pass_on_rollouts(
+            config=config,
+            model=model,
+            query_responses=query_responses,
+            local_rollout_forward_batch_size=config.local_rollout_forward_batch_size,
+            context_length=context_length,
+            pad_token_id=processing_class.pad_token_id,
+            padding_mask=padding_mask,
+            padding_mask_plus_one=padding_mask_plus_one,
+            ref_logprobs=ref_logprobs,
         )
         priorities, returns = prioritise_batch(
-            config,
-            responses,
-            state_values,
-            lam,
-            ref_logprobs,
-            new_logprobs,
-            rewards,
-            padding_mask_plus_one,
+            config=config,
+            responses=responses,
+            state_values=state_values,
+            lam=lam,
+            ref_logprobs=ref_logprobs,
+            new_logprobs=new_logprobs,
+            gen_logprobs=logprobs,
+            rewards=rewards,
+            padding_mask_plus_one=padding_mask_plus_one,
         )
         buffer.add_batch(
-            query_responses,
-            ref_logprobs,
-            new_logprobs,
-            returns,
-            priorities,
-            padding_mask,
-            padding_mask_plus_one,
+            query_responses=query_responses,
+            ref_logprobs=ref_logprobs,
+            gen_logprobs=logprobs,
+            rewards=rewards,
+            returns=returns,
+            priorities=priorities,
+            padding_mask=padding_mask,
+            padding_mask_plus_one=padding_mask_plus_one,
         )
 
     training_stop_time = time.perf_counter()
@@ -666,7 +740,7 @@ class KLQPERTrainer(OnPolicyTrainer):
     def __init__(
         self,
         # config and tokenizers
-        config: KLQConfig,
+        config: KLQPERConfig,
         processing_class: ProcessingClass,
         reward_model_processing_class: ProcessingClass,
         # models
@@ -700,9 +774,7 @@ class KLQPERTrainer(OnPolicyTrainer):
             optimizers=optimizers,
             callbacks=callbacks,
         )
-
-        # TODO: initialise the buffer
-        self.buffer = PERBuffer(config.replay_buffer_size)
+        self.buffer = None
 
     def _initialise_stats(self) -> KLQPERStats:
         stats_shape = (
@@ -716,8 +788,18 @@ class KLQPERTrainer(OnPolicyTrainer):
         self,
         data: Dict[str, torch.Tensor],
     ) -> Dict[str, float]:
+        if self.buffer is None:
+            queries = data["input_ids"]
+            query_length = queries.shape[1]
+
+            self.buffer = PERBuffer(
+                capacity=self.args.replay_buffer_capacity,
+                query_length=query_length,
+                response_length=self.args.response_length,
+                vocab_size=self.processing_class.vocab_size,
+            )
+
         return klq_per_batch_update(
-            buffer=self.buffer,  # TODO check
             # config-like and tokenizers
             config=self.args,
             generation_config=self.train_generation_config,
@@ -733,6 +815,7 @@ class KLQPERTrainer(OnPolicyTrainer):
             reward_model=self.reward_model,
             klq_stats=self.stats,
             # data for this batch!
+            buffer=self.buffer,
             data=data,
             # Scheduled parameters
             lam=self.lambda_scheduler.get(),
