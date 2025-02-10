@@ -91,6 +91,8 @@ _import_structure = {
         "PPOTrainer",
         "KLQTrainer",
         "KLQConfig",
+        "KLQPERConfig",
+        "KLQPERTrainer",
         "PPOv2Config",
         "PPOv2Trainer",
         "RandomPairwiseJudge",

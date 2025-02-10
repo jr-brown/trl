@@ -7,6 +7,7 @@ from typing import List
 from torch import Tensor
 
 
+# NOTE: want to incorporate some device checking
 @dataclass
 class TensorSamples(ABC):
     """Holding collections of tensors of shared 'batch' dimension."""

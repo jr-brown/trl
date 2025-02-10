@@ -127,8 +127,8 @@ def prioritise_batch(
     # Priority computation
     from trl.core import masked_mean
 
-    priorities = masked_mean(Deltas**2, ~padding_mask_plus_one)
-
+    priorities = masked_mean(Deltas**2, ~padding_mask_plus_one, axis=1)
+    # Take mean over the length dimension, not batch dimension
     return priorities, returns
 
 
@@ -141,20 +141,26 @@ class PERBuffer:
         capacity: int,
         query_length: int,
         response_length: int,
-        vocab_size: int,
+        device: torch.device,
     ):
         self.capacity = capacity
-        self.row_available = torch.ones(capacity, dtype=torch.bool)
+        self.device = device
+        self.row_available = torch.ones(capacity, dtype=torch.bool, device=device)
         qr_length = query_length + response_length
-        self.query_responses = torch.zeros((capacity, qr_length), dtype=torch.int32)
-        self.ref_logprobs = torch.zeros((capacity, qr_length, vocab_size))
-        self.gen_logprobs = torch.zeros((capacity, qr_length, vocab_size))
-        self.rewards = torch.zeros((capacity, qr_length))
-        self.returns = torch.zeros((capacity, qr_length))
-        self.priorities = torch.zeros(capacity)
-        self.padding_mask = torch.zeros((capacity, qr_length), dtype=torch.bool)
+        self.qr_length = qr_length
+        self.query_responses = torch.zeros(
+            (capacity, qr_length), dtype=torch.long, device=device
+        )
+        self.ref_logprobs = torch.zeros((capacity, response_length), device=device)
+        self.gen_logprobs = torch.zeros((capacity, response_length), device=device)
+        self.rewards = torch.zeros((capacity, response_length), device=device)
+        self.returns = torch.zeros((capacity, response_length), device=device)
+        self.priorities = torch.zeros(capacity, device=device)
+        self.padding_mask = torch.zeros(
+            (capacity, response_length), dtype=torch.bool, device=device
+        )
         self.padding_mask_plus_one = torch.zeros(
-            (capacity, qr_length), dtype=torch.bool
+            (capacity, response_length), dtype=torch.bool, device=device
         )
 
     @property
@@ -174,13 +180,17 @@ class PERBuffer:
         padding_mask_plus_one,
     ):
         """Add a batch of samples to the buffer."""
+        # NOTE: could read device from query_responses etc also
         # if there are insufficient empty rows, mark the lowest priority rows for overwrite
-        if torch.sum(self.row_available) < len(query_responses):
-            idxs_to_overwrite = torch.argsort(self.priorities)[: len(query_responses)]
+        num_samples_in = query_responses.shape[0]
+        if torch.sum(self.row_available) < num_samples_in:
+            idxs_to_overwrite = torch.argsort(self.priorities)[:num_samples_in]
             self.row_available[idxs_to_overwrite] = True
         # get first available rows now have now guaranteed that there are enough
-        idxs_available = torch.arange(self.capacity)[self.row_available]
-        idxs_to_write = idxs_available[: len(query_responses)]
+        idxs_available = torch.arange(self.capacity, device=self.device)[
+            self.row_available
+        ]
+        idxs_to_write = idxs_available[:num_samples_in]
 
         self.query_responses[idxs_to_write] = query_responses
         self.ref_logprobs[idxs_to_write] = ref_logprobs
@@ -493,7 +503,7 @@ def klq_per_batch_update(
         (
             responses,
             postprocessed_responses,
-            logprobs,
+            gen_logprobs,
             ref_logprobs,
             sequence_lengths,
             scores,
@@ -514,7 +524,7 @@ def klq_per_batch_update(
             ref_temperature=config.train_temperature,
             device=device,
         )
-        action_values = config.kl_coef * (logprobs - ref_logprobs) + state_values
+        action_values = config.kl_coef * (gen_logprobs - ref_logprobs) + state_values
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -534,7 +544,7 @@ def klq_per_batch_update(
             responses.shape[1], device=responses.device
         ).repeat(responses.shape[0], 1)
         padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
-        logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
+        gen_logprobs = torch.masked_fill(gen_logprobs, padding_mask, INVALID_LOGPROB)
         ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
         sequence_lengths_plus_one = sequence_lengths + 1
         padding_mask_plus_one = response_idxs > (sequence_lengths_plus_one.unsqueeze(1))
@@ -542,7 +552,7 @@ def klq_per_batch_update(
         action_values = torch.masked_fill(action_values, padding_mask_plus_one, 0)
 
         # 4. compute rewards
-        prev_ref_log_ratio = logprobs - ref_logprobs  # This is just for logging!
+        prev_ref_log_ratio = gen_logprobs - ref_logprobs  # This is just for logging!
         prev_ref_log_ratio = torch.masked_fill(
             prev_ref_log_ratio, padding_mask, 0
         )  # Set the log-ratio to 0 for padding tokens.
@@ -551,7 +561,7 @@ def klq_per_batch_update(
         )  # This is just for logging!
 
         # rewards has shape [batch, response_length]
-        rewards = torch.zeros_like(logprobs)
+        rewards = torch.zeros_like(gen_logprobs)
         batch_indices = torch.arange(
             rewards.size(0), device=rewards.device
         )  # [0, 1, 2, ..., batch_size - 1]
@@ -608,7 +618,7 @@ def klq_per_batch_update(
     if per_training:
         query_responses = torch.cat([query_responses, replayed_query_responses], dim=0)
         ref_logprobs = torch.cat([ref_logprobs, replayed_ref_logprobs], dim=0)
-        gen_logprobs = torch.cat([logprobs, replayed_gen_logprobs], dim=0)
+        gen_logprobs = torch.cat([gen_logprobs, replayed_gen_logprobs], dim=0)
         rewards = torch.cat([rewards, replayed_rewards], dim=0)
         returns = torch.cat([returns, replayed_returns], dim=0)
         padding_mask = torch.cat([padding_mask, replayed_padding_mask], dim=0)
@@ -675,14 +685,14 @@ def klq_per_batch_update(
             lam=lam,
             ref_logprobs=ref_logprobs,
             new_logprobs=new_logprobs,
-            gen_logprobs=logprobs,
+            gen_logprobs=gen_logprobs,
             rewards=rewards,
             padding_mask_plus_one=padding_mask_plus_one,
         )
         buffer.add_batch(
             query_responses=query_responses,
             ref_logprobs=ref_logprobs,
-            gen_logprobs=logprobs,
+            gen_logprobs=gen_logprobs,
             rewards=rewards,
             returns=returns,
             priorities=priorities,
@@ -793,10 +803,10 @@ class KLQPERTrainer(OnPolicyTrainer):
             query_length = queries.shape[1]
 
             self.buffer = PERBuffer(
-                capacity=self.args.replay_buffer_capacity,
+                capacity=self.args.local_replay_buffer_capacity,
                 query_length=query_length,
                 response_length=self.args.response_length,
-                vocab_size=self.processing_class.vocab_size,
+                device=self.accelerator.device,
             )
 
         return klq_per_batch_update(
