@@ -146,7 +146,7 @@ class PERBuffer:
         self.capacity = capacity
         self.row_available = torch.ones(capacity, dtype=torch.bool)
         qr_length = query_length + response_length
-        self.query_responses = torch.zeros((capacity, qr_length))
+        self.query_responses = torch.zeros((capacity, qr_length), dtype=torch.int32)
         self.ref_logprobs = torch.zeros((capacity, qr_length, vocab_size))
         self.gen_logprobs = torch.zeros((capacity, qr_length, vocab_size))
         self.rewards = torch.zeros((capacity, qr_length))
