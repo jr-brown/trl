@@ -16,11 +16,20 @@ __version__ = "0.12.0.dev0"
 
 from typing import TYPE_CHECKING
 
-from .import_utils import OptionalDependencyNotAvailable, _LazyModule, is_diffusers_available
+from .import_utils import (
+    OptionalDependencyNotAvailable,
+    _LazyModule,
+    is_diffusers_available,
+)
 
 
 _import_structure = {
-    "commands.cli_utils": ["DPOScriptArguments", "SFTScriptArguments", "TrlParser", "init_zero_verbose"],
+    "commands.cli_utils": [
+        "DPOScriptArguments",
+        "SFTScriptArguments",
+        "TrlParser",
+        "init_zero_verbose",
+    ],
     "core": ["set_seed"],
     "data_utils": [
         "apply_chat_template",
@@ -97,7 +106,11 @@ _import_structure = {
         "XPOTrainer",
     ],
     "trainer.callbacks": ["RichProgressCallback", "SyncRefModelCallback"],
-    "trainer.utils": ["get_kbit_device_map", "get_peft_config", "get_quantization_config"],
+    "trainer.utils": [
+        "get_kbit_device_map",
+        "get_peft_config",
+        "get_quantization_config",
+    ],
     "utils": ["ScriptArguments"],
 }
 
@@ -118,7 +131,12 @@ else:
     _import_structure["trainer"].extend(["DDPOConfig", "DDPOTrainer"])
 
 if TYPE_CHECKING:
-    from .commands.cli_utils import DPOScriptArguments, SFTScriptArguments, TrlParser, init_zero_verbose
+    from .commands.cli_utils import (
+        DPOScriptArguments,
+        SFTScriptArguments,
+        TrlParser,
+        init_zero_verbose,
+    )
     from .core import set_seed
     from .data_utils import (
         apply_chat_template,
@@ -180,6 +198,8 @@ if TYPE_CHECKING:
         PPOTrainer,
         KLQTrainer,
         KLQConfig,
+        KLQPERConfig,
+        KLQPERTrainer,
         PPOv2Config,
         PPOv2Trainer,
         RandomPairwiseJudge,
@@ -195,7 +215,11 @@ if TYPE_CHECKING:
         XPOTrainer,
     )
     from .trainer.callbacks import RichProgressCallback, SyncRefModelCallback
-    from .trainer.utils import get_kbit_device_map, get_peft_config, get_quantization_config
+    from .trainer.utils import (
+        get_kbit_device_map,
+        get_peft_config,
+        get_quantization_config,
+    )
     from .utils import ScriptArguments
 
     try:
