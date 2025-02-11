@@ -468,6 +468,9 @@ def forward_pass_on_rollouts(
     And then combining with on_policy_utils/calc_ref_logprob.
 
     For now this is 'written', but expect many bugs."""
+    new_logprobs_list = []
+    new_state_values_list = []
+
     for i in range(0, query_responses.shape[0], local_rollout_forward_batch_size):
         local_rollout_indices = slice(i, i + local_rollout_forward_batch_size)
         query_response = query_responses[local_rollout_indices]
@@ -496,4 +499,9 @@ def forward_pass_on_rollouts(
             state_value_prediction, padding_mask_plus_one[local_rollout_indices], 0
         )
 
+        new_logprobs_list.append(new_logprobs)
+        new_state_values_list.append(state_value_prediction)
+
+    new_logprobs = torch.cat(new_logprobs_list, 0)
+    state_value_prediction = torch.cat(new_state_values_list, 0)
     return new_logprobs, state_value_prediction
