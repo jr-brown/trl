@@ -151,6 +151,9 @@ class PERBuffer:
         self.query_responses = torch.zeros(
             (capacity, qr_length), dtype=torch.long, device=device
         )
+        self.responses = torch.zeros(
+            (capacity, response_length), dtype=torch.long, device=device
+        )
         self.ref_logprobs = torch.zeros((capacity, response_length), device=device)
         self.gen_logprobs = torch.zeros((capacity, response_length), device=device)
         self.rewards = torch.zeros((capacity, response_length), device=device)
@@ -171,6 +174,7 @@ class PERBuffer:
     def add_batch(
         self,
         query_responses,
+        responses,
         ref_logprobs,
         gen_logprobs,
         rewards,
@@ -190,9 +194,13 @@ class PERBuffer:
         idxs_available = torch.arange(self.capacity, device=self.device)[
             self.row_available
         ]
+        assert (
+            len(idxs_available) >= num_samples_in
+        ), f"{len(idxs_available)=}, {num_samples_in=}"
         idxs_to_write = idxs_available[:num_samples_in]
 
         self.query_responses[idxs_to_write] = query_responses
+        self.responses[idxs_to_write] = responses
         self.ref_logprobs[idxs_to_write] = ref_logprobs
         self.gen_logprobs[idxs_to_write] = gen_logprobs
         self.rewards[idxs_to_write] = rewards
@@ -207,6 +215,7 @@ class PERBuffer:
         idxs_to_pop = torch.argsort(self.priorities, descending=True)[:pop_batch_size]
         # TODO: Implement sampling with probabilities proportional to priority to the alpha.
         query_responses = self.query_responses[idxs_to_pop]
+        responses = self.responses[idxs_to_pop]
         ref_logprobs = self.ref_logprobs[idxs_to_pop]
         gen_logprobs = self.gen_logprobs[idxs_to_pop]
         rewards = self.rewards[idxs_to_pop]
@@ -217,6 +226,7 @@ class PERBuffer:
         self.row_available[idxs_to_pop] = True
         return (
             query_responses,
+            responses,
             ref_logprobs,
             gen_logprobs,
             rewards,
@@ -468,6 +478,7 @@ def klq_per_batch_update(
         assert replay_number <= buffer.num_samples, "Not enough samples in buffer."
         (
             replayed_query_responses,
+            replayed_responses,
             replayed_ref_logprobs,
             replayed_gen_logprobs,
             replayed_rewards,
@@ -617,6 +628,7 @@ def klq_per_batch_update(
 
     if per_training:
         query_responses = torch.cat([query_responses, replayed_query_responses], dim=0)
+        responses = torch.cat([responses, replayed_responses], dim=0)
         ref_logprobs = torch.cat([ref_logprobs, replayed_ref_logprobs], dim=0)
         gen_logprobs = torch.cat([gen_logprobs, replayed_gen_logprobs], dim=0)
         rewards = torch.cat([rewards, replayed_rewards], dim=0)
@@ -691,6 +703,7 @@ def klq_per_batch_update(
         )
         buffer.add_batch(
             query_responses=query_responses,
+            responses=responses,
             ref_logprobs=ref_logprobs,
             gen_logprobs=gen_logprobs,
             rewards=rewards,
