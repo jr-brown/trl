@@ -276,6 +276,7 @@ def micro_batch_updates(
     mini_batch_end = mini_batch_start + config.local_mini_batch_size
     mini_batch_inds = batch_inds[mini_batch_start:mini_batch_end]
     gradient_accumulation_idx = 0
+
     for micro_batch_start in range(
         0, config.local_mini_batch_size, config.per_device_train_batch_size
     ):
@@ -407,8 +408,8 @@ def micro_batch_updates(
 def klq_batch_update(
     config: KLQConfig,
     generation_config,
+    scoring_function,
     processing_class,
-    reward_model_processing_class,
     # optimisation / performance
     optimizer,
     accelerator,
@@ -416,7 +417,6 @@ def klq_batch_update(
     # stateful parameters to be updated
     model,
     ref_policy,
-    reward_model,
     klq_stats: KLQStats,
     # data for the this batch!
     data: Dict[str, Tensor],
@@ -428,7 +428,13 @@ def klq_batch_update(
 
     with torch.no_grad():
         queries = data["input_ids"].to(device)
+        maybe_answer_ids = data.get("answer_ids")
+
+        if maybe_answer_ids is not None:
+            maybe_answer_ids = maybe_answer_ids.to(device)
+
         context_length = queries.shape[1]
+
         with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
             # query_respones and logitss are both torch Tensors.
             # query_responses has shape [batch, query_length]
@@ -454,18 +460,17 @@ def klq_batch_update(
         ) = rollouts_to_loss_variables(
             queries=queries,
             query_responses=query_responses,
+            maybe_answer_ids=maybe_answer_ids,
             logitss=logitss,
             ref_policy=ref_policy,
             unwrapped_value_model=accelerator.unwrap_model(model).value_model,
-            reward_model=reward_model,
             processing_class=processing_class,
-            reward_model_processing_class=reward_model_processing_class,
             context_length=context_length,
             stop_token_id=config.stop_token_id,
             response_truncation_sequences=config.response_truncation_sequences,
             local_rollout_forward_batch_size=config.local_rollout_forward_batch_size,
             ref_temperature=config.train_temperature,
-            device=device,
+            scoring_function=scoring_function,
         )
         action_values = config.kl_coef * (logprobs - ref_logprobs) + state_values
         torch.cuda.empty_cache()
@@ -702,13 +707,14 @@ class KLQTrainer(OnPolicyTrainer):
     def _batch_update(
         self,
         data: Dict[str, torch.Tensor],
+        scoring_function: Callable,
     ) -> Dict[str, float]:
         return klq_batch_update(
             # config-like and tokenizers
             config=self.args,
             generation_config=self.train_generation_config,
+            scoring_function=scoring_function,
             processing_class=self.processing_class,
-            reward_model_processing_class=self.reward_model_processing_class,
             # optimisation / performance
             optimizer=self.optimizer,
             accelerator=self.accelerator,
@@ -716,7 +722,6 @@ class KLQTrainer(OnPolicyTrainer):
             # stateful models and stats to be updated
             model=self.model,
             ref_policy=self.ref_policy,
-            reward_model=self.reward_model,
             klq_stats=self.stats,
             # data for this batch!
             data=data,

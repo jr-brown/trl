@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import gc
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable
 import time
 
 import numpy as np
@@ -237,8 +237,8 @@ def ppo_micro_batch_updates(
 def ppo_batch_update(
     config,
     generation_config,
+    scoring_function,
     processing_class,
-    reward_model_processing_class,
     # GPU related things
     device: torch.device,
     accelerator,
@@ -246,7 +246,6 @@ def ppo_batch_update(
     # stateful parameters
     model,
     ref_policy,
-    reward_model,
     ppo_stats,
     # data for this batch
     data,
@@ -259,6 +258,11 @@ def ppo_batch_update(
     # Generate a PPO dataset for this update phase
     with torch.no_grad():
         queries = data["input_ids"].to(device)
+        maybe_answer_ids = data.get("answer_ids")
+
+        if maybe_answer_ids is not None:
+            maybe_answer_ids = maybe_answer_ids.to(device)
+
         context_length = queries.shape[1]
 
         with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
@@ -285,18 +289,17 @@ def ppo_batch_update(
         ) = rollouts_to_loss_variables(
             queries=queries,
             query_responses=query_responses,
+            maybe_answer_ids=maybe_answer_ids,
             logitss=logitss,
             ref_policy=ref_policy,
             unwrapped_value_model=accelerator.unwrap_model(model).value_model,
-            reward_model=reward_model,
             processing_class=processing_class,
-            reward_model_processing_class=reward_model_processing_class,
             context_length=context_length,
             stop_token_id=config.stop_token_id,
             response_truncation_sequences=config.response_truncation_sequences,
             local_rollout_forward_batch_size=config.local_rollout_forward_batch_size,
             ref_temperature=config.train_temperature,
-            device=device,
+            scoring_function=scoring_function,
         )
         torch.cuda.empty_cache()
         gc.collect()
@@ -518,13 +521,14 @@ class PPOTrainer(OnPolicyTrainer):
     def _batch_update(
         self,
         data: Dict[str, torch.Tensor],
+        scoring_function: Callable,
     ) -> Dict[str, float]:
         return ppo_batch_update(
             # config-like and tokenizers
             config=self.args,
             generation_config=self.train_generation_config,
+            scoring_function=scoring_function,
             processing_class=self.processing_class,
-            reward_model_processing_class=self.reward_model_processing_class,
             # optimisation / performance
             optimizer=self.optimizer,
             accelerator=self.accelerator,
@@ -532,7 +536,6 @@ class PPOTrainer(OnPolicyTrainer):
             # stateful models and stats to be updated
             model=self.model,
             ref_policy=self.ref_policy,
-            reward_model=self.reward_model,
             ppo_stats=self.stats,
             # data for this batch!
             data=data,

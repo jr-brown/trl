@@ -209,18 +209,17 @@ def calc_ref_logprob(
 def rollouts_to_loss_variables(
     queries,
     query_responses,
+    maybe_answer_ids,
     logitss,
     ref_policy,
     unwrapped_value_model,
-    reward_model,
     processing_class,
-    reward_model_processing_class,
     context_length,
     stop_token_id,
     response_truncation_sequences: list[list[int]],
     local_rollout_forward_batch_size,
     ref_temperature,
-    device,
+    scoring_function,
 ):
     """
     Takes in an iteration batch of queries and responses, and computes various variables needed for defining the loss function.
@@ -314,19 +313,8 @@ def rollouts_to_loss_variables(
         )
         # Extract only the value estimates for the completion
         state_value = full_value[:, context_length - 1 : -1].squeeze(-1)
-        # The score is the reward at the end of each query sequence.
-        # score has shape [batch]
-        reward_model_inputs, reward_model_pad_token = retokenize(
-            postprocessed_query_response,
-            device,
-            processing_class,
-            reward_model_processing_class,
-        )
-        score = get_just_reward(
-            reward_model,
-            reward_model_inputs,
-            reward_model_pad_token,
-        )
+
+        score = scoring_function(postprocessed_query_response, maybe_answer_ids)
 
         # This is just a bunch of logging stuff
         responses.append(response)
@@ -435,6 +423,7 @@ class OnPolicyConfig(TrainingArguments):
     eval_rollout_temperature: float = 1.0
     missing_eos_penalty: Optional[float] = None
     sft_model_path: str = "EleutherAI/pythia-160m"
+    reward_model_path: str | None = None
     world_size: Optional[int] = None
     num_total_batches: Optional[int] = None
     micro_batch_size: Optional[int] = None
@@ -449,3 +438,5 @@ class OnPolicyConfig(TrainingArguments):
     final_lam: Optional[float] = None
     lam_episode_length: Optional[int] = None
     lam_schedule_type: str = "linear"
+    final_answer_split_str: str | None = None
+

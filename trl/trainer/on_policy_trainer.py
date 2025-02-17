@@ -20,7 +20,7 @@ import time
 import logging
 
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable
 from abc import ABC, abstractmethod
 
 import pandas as pd
@@ -119,11 +119,9 @@ class OnPolicyTrainer(ABC, Trainer):
         # config and tokenizers
         config: OnPolicyConfig,
         processing_class: ProcessingClass,
-        reward_model_processing_class: ProcessingClass,
         # models
         policy: nn.Module,
         ref_policy: nn.Module,
-        reward_model: nn.Module,
         value_model: nn.Module,
         # datasets and loaders
         train_dataset: Dataset,
@@ -135,6 +133,8 @@ class OnPolicyTrainer(ABC, Trainer):
             None,
         ),
         callbacks: Optional[List[TrainerCallback]] = None,
+        reward_model_processing_class: ProcessingClass | None = None,
+        reward_model: nn.Module | None = None,
     ) -> None:
         """
         TERMINOLOGY:
@@ -366,8 +366,12 @@ class OnPolicyTrainer(ABC, Trainer):
         #########
         # setup model, optimizer, and others
         #########
-        for module in [policy, ref_policy, value_model, reward_model]:
+        for module in [policy, ref_policy, value_model]:
             disable_dropout_in_model(module)
+
+        if reward_model is not None:
+            disable_dropout_in_model(reward_model)
+
         if config.stop_token and config.stop_token == "eos":  ### FLAG
             config.stop_token_id = processing_class.eos_token_id
         self.model = PolicyAndValueWrapper(policy, value_model)
@@ -451,21 +455,24 @@ class OnPolicyTrainer(ABC, Trainer):
         self.eval_dataloader = accelerator.prepare(self.eval_dataloader)
 
         if self.is_deepspeed_enabled:
-            self.reward_model = prepare_deepspeed(
-                self.reward_model,
-                config.per_device_train_batch_size,
-                config.fp16,
-                config.bf16,
-            )
             self.ref_policy = prepare_deepspeed(
                 self.ref_policy,
                 config.per_device_train_batch_size,
                 config.fp16,
                 config.bf16,
             )
+            if self.reward_model is not None:
+                self.reward_model = prepare_deepspeed(
+                    self.reward_model,
+                    config.per_device_train_batch_size,
+                    config.fp16,
+                    config.bf16,
+                )
         else:
             self.ref_policy = self.ref_policy.to(self.accelerator.device)
-            self.reward_model = self.reward_model.to(self.accelerator.device)
+
+            if self.reward_model is not None:
+                self.reward_model = self.reward_model.to(self.accelerator.device)
 
         #########
         ### extra stateful setting up added by Lennie 11 Nov
@@ -524,6 +531,7 @@ class OnPolicyTrainer(ABC, Trainer):
     def _batch_update(
         self,
         data: Dict[str, torch.Tensor],
+        scoring_function: Callable,
     ) -> Dict[str, torch.Tensor]:
         """Returns metrics for the batch.
         (Other updates are performed in place)."""
@@ -591,6 +599,58 @@ class OnPolicyTrainer(ABC, Trainer):
             self.deepspeed = self.model
             self.model_wrapped = self.model
 
+        # Define function for computing score as could be RM or rule based
+        def scoring_function(postprocessed_query_response, maybe_answer_ids):
+            if self.reward_model is not None:
+                # The score is the reward at the end of each query sequence.
+                # score has shape [batch]
+                reward_model_inputs, reward_model_pad_token = retokenize(
+                    postprocessed_query_response,
+                    self.accelerator.device,
+                    self.processing_class,
+                    self.reward_model_processing_class,
+                )
+                return get_just_reward(
+                    self.reward_model,
+                    reward_model_inputs,
+                    reward_model_pad_token,
+                )
+
+            elif maybe_answer_ids is not None:
+                assert config.final_answer_split_str is not None
+
+                decoded_answers = self.processing_class.batch_decode(
+                    maybe_answer_ids, skip_special_tokens=True
+                )
+                final_answer_txts = [
+                    x.split(config.final_answer_split_str)[-1]
+                    for x in decoded_answers
+                ]
+
+                decoded_responses = self.processing_class.batch_decode(
+                    postprocessed_query_response, skip_special_tokens=True
+                )
+#                models_final_answer_txts = [
+#                    x.split(config.final_answer_split_str)[-1]
+#                    for x in decoded_responses
+#                ]
+                # -1 if bad format, 0 if otherwise incorrect, 1 if correct
+                return torch.tensor([
+                    (
+                        -1.0
+                        if len(ans_parts := raw_x.split(config.final_answer_split_str)) <= 1 else
+                        float(y == ans_parts[-1])
+                    )
+                    for y, raw_x in zip(final_answer_txts, decoded_responses)
+                ])
+#                return torch.tensor([
+#                    float(y == yhat)
+#                    for y, yhat in zip(final_answer_txts, models_final_answer_txts)
+#                ])
+
+            else:
+                raise ValueError("Need either a reward model or dataset-specified answer text in order to determine reward for answer.")
+
         # The actual training loop
         for update in range(1, config.num_total_batches + 1):
             self.state.episode += 1 * config.batch_size
@@ -598,7 +658,7 @@ class OnPolicyTrainer(ABC, Trainer):
 
             # Main training function
             # (see implementations in child classes)
-            metrics = self._batch_update(data=data)
+            metrics = self._batch_update(data=data, scoring_function=scoring_function)
 
             total_generation_time += metrics["time/iteration/generation"]
             total_processing_time += metrics["time/iteration/processing"]
@@ -635,6 +695,7 @@ class OnPolicyTrainer(ABC, Trainer):
                 and (update - 1) % self.sample_generations_freq == 0
             ):
                 self.generate_eval_completions(
+                    scoring_function=scoring_function,
                     max_num_batches=config.max_num_eval_batches
                 )
                 torch.cuda.empty_cache()
@@ -665,7 +726,8 @@ class OnPolicyTrainer(ABC, Trainer):
         unwrapped_model,
         query,
         processing_class,
-        reward_model_processing_class,
+        scoring_function,
+        maybe_answer_ids,
     ):
         context_length = query.shape[1]
         query_response, logits = batch_generation(
@@ -701,17 +763,7 @@ class OnPolicyTrainer(ABC, Trainer):
         )
 
         postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-        reward_model_inputs, reward_model_pad_token = retokenize(
-            postprocessed_query_response,
-            self.accelerator.device,
-            processing_class,
-            reward_model_processing_class,
-        )
-        score = get_just_reward(
-            self.reward_model,
-            reward_model_inputs,
-            reward_model_pad_token,
-        )
+        score = scoring_function(postprocessed_query_response, maybe_answer_ids)
 
         # KL div and rlhf reward calc, see relevant code in on_policy_utils and ppo_trainer for explanatory comments
 
@@ -765,7 +817,11 @@ class OnPolicyTrainer(ABC, Trainer):
 
         return decoded_query, decoded_response, score, reward, prev_ref_log_ratio
 
-    def generate_eval_completions(self, max_num_batches: Optional[int] = None):
+    def generate_eval_completions(
+        self,
+        scoring_function,
+        max_num_batches: Optional[int] = None,
+    ):
         """
         Generate completions for the eval dataset and log the completions and their scores.
 
@@ -793,6 +849,8 @@ class OnPolicyTrainer(ABC, Trainer):
                 log.debug(f"Batch {i}, shape={batch['input_ids'].shape}")
 
                 query = batch["input_ids"]
+                maybe_answer_ids = batch.get("answer_ids")
+
                 with torch.no_grad():
                     (
                         decoded_query,
@@ -805,7 +863,8 @@ class OnPolicyTrainer(ABC, Trainer):
                         unwrapped_model=unwrapped_model,
                         query=query,
                         processing_class=processing_class,
-                        reward_model_processing_class=reward_model_processing_class,
+                        scoring_function=scoring_function,
+                        maybe_answer_ids=maybe_answer_ids,
                     )
                     table["query"].extend(decoded_query)
                     table["model response"].extend(decoded_response)
