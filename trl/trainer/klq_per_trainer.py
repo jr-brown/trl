@@ -151,23 +151,38 @@ class PERBuffer:
         sampling: bool = False,
         sampling_power: float = 0.5,
     ):
+        self.dtype = self._autodetect_types()
         self.capacity = capacity
         self.device = device
         self.row_available = torch.ones(capacity, dtype=torch.bool, device=device)
         qr_length = query_length + response_length
         self.qr_length = qr_length
+        # longs
         self.query_responses = torch.zeros(
             (capacity, qr_length), dtype=torch.long, device=device
         )
         self.responses = torch.zeros(
             (capacity, response_length), dtype=torch.long, device=device
         )
-        self.state_values = torch.zeros((capacity, response_length), device=device)
-        self.ref_logprobs = torch.zeros((capacity, response_length), device=device)
-        self.gen_logprobs = torch.zeros((capacity, response_length), device=device)
-        self.rewards = torch.zeros((capacity, response_length), device=device)
-        self.returns = torch.zeros((capacity, response_length), device=device)
-        self.priorities = torch.zeros((capacity,), device=device)
+        # floats
+        self.state_values = torch.zeros(
+            (capacity, response_length), device=device, dtype=self.dtype
+        )
+        self.ref_logprobs = torch.zeros(
+            (capacity, response_length), device=device, dtype=self.dtype
+        )
+        self.gen_logprobs = torch.zeros(
+            (capacity, response_length), device=device, dtype=self.dtype
+        )
+        self.rewards = torch.zeros(
+            (capacity, response_length), device=device, dtype=self.dtype
+        )
+        self.returns = torch.zeros(
+            (capacity, response_length), device=device, dtype=self.dtype
+        )
+        self.priorities = torch.zeros((capacity,), device=device, dtype=self.dtype)
+
+        # bools
         self.padding_mask = torch.zeros(
             (capacity, response_length), dtype=torch.bool, device=device
         )
@@ -176,6 +191,26 @@ class PERBuffer:
         )
         self.sampling = sampling
         self.sampling_power = sampling_power
+
+    def _autodetect_types(self) -> torch.dtype:
+        """Sets self.dtype to bf16 if available (thanks Claude)."""
+        if hasattr(torch, "bfloat16") and torch.cuda.is_available():
+            try:
+                import accelerate
+
+                # Check if accelerate is configured for bf16
+                if accelerate.utils.is_bf16_available():
+                    dtype = torch.bfloat16
+                else:
+                    dtype = torch.float32
+            except ImportError:
+                # No accelerate, default to float32
+                dtype = torch.float32
+        else:
+            # No bfloat16 support, use float32
+            dtype = torch.float32
+
+        return dtype
 
     @property
     def num_samples(self):
@@ -220,12 +255,12 @@ class PERBuffer:
 
         self.query_responses[idxs_to_write] = query_responses
         self.responses[idxs_to_write] = responses
-        self.state_values[idxs_to_write] = state_values
-        self.ref_logprobs[idxs_to_write] = ref_logprobs
-        self.gen_logprobs[idxs_to_write] = gen_logprobs
-        self.rewards[idxs_to_write] = rewards
-        self.returns[idxs_to_write] = returns
-        self.priorities[idxs_to_write] = priorities
+        self.state_values[idxs_to_write] = state_values.to(dtype=self.dtype)
+        self.ref_logprobs[idxs_to_write] = ref_logprobs.to(dtype=self.dtype)
+        self.gen_logprobs[idxs_to_write] = gen_logprobs.to(dtype=self.dtype)
+        self.rewards[idxs_to_write] = rewards.to(dtype=self.dtype)
+        self.returns[idxs_to_write] = returns.to(dtype=self.dtype)
+        self.priorities[idxs_to_write] = priorities.to(dtype=self.dtype)
         self.padding_mask[idxs_to_write] = padding_mask
         self.padding_mask_plus_one[idxs_to_write] = padding_mask_plus_one
         self.row_available[idxs_to_write] = False
