@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import logging
 from typing import Dict, List, Optional, Tuple, Union, Callable
 import time
 
@@ -50,6 +51,9 @@ from .on_policy_trainer import OnPolicyTrainer
 # new imports for PER file
 from .klq_trainer import loss_function_map, LossFunctionTensors
 
+
+log = logging.getLogger(__name__)
+
 ProcessingClass = PreTrainedTokenizerBase
 
 
@@ -65,6 +69,8 @@ class KLQPERConfig(KLQConfig):
     local_replay_buffer_capacity: int = 250
     replay_rate: float = 0.5
     local_learning_starts: int = 100
+    buffer_sampling: bool = False
+    buffer_sampling_power: float = 0.5
     retrace: bool = True
     retrace_clip: float = 1.0
     expert_retrace_clip: float = 0.95
@@ -142,6 +148,8 @@ class PERBuffer:
         query_length: int,
         response_length: int,
         device: torch.device,
+        sampling: bool = False,
+        sampling_power: float = 0.5,
     ):
         self.capacity = capacity
         self.device = device
@@ -154,27 +162,42 @@ class PERBuffer:
         self.responses = torch.zeros(
             (capacity, response_length), dtype=torch.long, device=device
         )
+        self.state_values = torch.zeros((capacity, response_length), device=device)
         self.ref_logprobs = torch.zeros((capacity, response_length), device=device)
         self.gen_logprobs = torch.zeros((capacity, response_length), device=device)
         self.rewards = torch.zeros((capacity, response_length), device=device)
         self.returns = torch.zeros((capacity, response_length), device=device)
-        self.priorities = torch.zeros(capacity, device=device)
+        self.priorities = torch.zeros((capacity,), device=device)
         self.padding_mask = torch.zeros(
             (capacity, response_length), dtype=torch.bool, device=device
         )
         self.padding_mask_plus_one = torch.zeros(
             (capacity, response_length), dtype=torch.bool, device=device
         )
+        self.sampling = sampling
+        self.sampling_power = sampling_power
 
     @property
     def num_samples(self):
         """Number of rows corresponding to previous experiences."""
         return torch.sum(~self.row_available)
 
+    @property
+    def priority_stats(self):
+        """Min, max, mean, std of priorities"""
+        filtered_priorities = self.priorities[~self.row_available]
+        return {
+            "min": torch.min(filtered_priorities).item(),
+            "max": torch.max(filtered_priorities).item(),
+            "mean": torch.mean(filtered_priorities).item(),
+            "std": torch.std(filtered_priorities).item(),
+        }
+
     def add_batch(
         self,
         query_responses,
         responses,
+        state_values,
         ref_logprobs,
         gen_logprobs,
         rewards,
@@ -187,20 +210,17 @@ class PERBuffer:
         # NOTE: could read device from query_responses etc also
         # if there are insufficient empty rows, mark the lowest priority rows for overwrite
         num_samples_in = query_responses.shape[0]
-        if torch.sum(self.row_available) < num_samples_in:
-            idxs_to_overwrite = torch.argsort(self.priorities)[:num_samples_in]
-            self.row_available[idxs_to_overwrite] = True
-        # get first available rows now have now guaranteed that there are enough
-        idxs_available = torch.arange(self.capacity, device=self.device)[
-            self.row_available
-        ]
+
         assert (
-            len(idxs_available) >= num_samples_in
-        ), f"{len(idxs_available)=}, {num_samples_in=}"
-        idxs_to_write = idxs_available[:num_samples_in]
+            priorities > 0
+        ).all(), f"All priorities should be strictly positive {priorities=}"
+
+        # newer simpler way to choose which indices: simply those with the lowest priority
+        idxs_to_write = torch.argsort(self.priorities)[:num_samples_in]
 
         self.query_responses[idxs_to_write] = query_responses
         self.responses[idxs_to_write] = responses
+        self.state_values[idxs_to_write] = state_values
         self.ref_logprobs[idxs_to_write] = ref_logprobs
         self.gen_logprobs[idxs_to_write] = gen_logprobs
         self.rewards[idxs_to_write] = rewards
@@ -212,10 +232,19 @@ class PERBuffer:
 
     def pop_batch(self, pop_batch_size: int):
         """Extracts the samples with highest priority from the buffer."""
-        idxs_to_pop = torch.argsort(self.priorities, descending=True)[:pop_batch_size]
-        # TODO: Implement sampling with probabilities proportional to priority to the alpha.
+        if self.sampling:
+            idxs_to_pop = torch.multinomial(
+                self.priorities**self.sampling_power,
+                pop_batch_size,
+                replacement=False,
+            )
+        else:
+            idxs_to_pop = torch.argsort(self.priorities, descending=True)[
+                :pop_batch_size
+            ]
         query_responses = self.query_responses[idxs_to_pop]
         responses = self.responses[idxs_to_pop]
+        state_values = self.state_values[idxs_to_pop]
         ref_logprobs = self.ref_logprobs[idxs_to_pop]
         gen_logprobs = self.gen_logprobs[idxs_to_pop]
         rewards = self.rewards[idxs_to_pop]
@@ -223,10 +252,12 @@ class PERBuffer:
         priorities = self.priorities[idxs_to_pop]
         padding_mask = self.padding_mask[idxs_to_pop]
         padding_mask_plus_one = self.padding_mask_plus_one[idxs_to_pop]
+        self.priorities[idxs_to_pop] = 0.0
         self.row_available[idxs_to_pop] = True
         return (
             query_responses,
             responses,
+            state_values,
             ref_logprobs,
             gen_logprobs,
             rewards,
@@ -476,9 +507,11 @@ def klq_per_batch_update(
         per_training = True
         replay_number = int(config.replay_rate * config.local_batch_size)
         assert replay_number <= buffer.num_samples, "Not enough samples in buffer."
+        log.info(f"Popping batch of size {replay_number=}")
         (
             replayed_query_responses,
             replayed_responses,
+            replayed_state_values,
             replayed_ref_logprobs,
             replayed_gen_logprobs,
             replayed_rewards,
@@ -629,6 +662,7 @@ def klq_per_batch_update(
     if per_training:
         query_responses = torch.cat([query_responses, replayed_query_responses], dim=0)
         responses = torch.cat([responses, replayed_responses], dim=0)
+        state_values = torch.cat([state_values, replayed_state_values], dim=0)
         ref_logprobs = torch.cat([ref_logprobs, replayed_ref_logprobs], dim=0)
         gen_logprobs = torch.cat([gen_logprobs, replayed_gen_logprobs], dim=0)
         rewards = torch.cat([rewards, replayed_rewards], dim=0)
@@ -704,6 +738,7 @@ def klq_per_batch_update(
         buffer.add_batch(
             query_responses=query_responses,
             responses=responses,
+            state_values=state_values,
             ref_logprobs=ref_logprobs,
             gen_logprobs=gen_logprobs,
             rewards=rewards,
@@ -753,6 +788,12 @@ def klq_per_batch_update(
     metrics["time/iteration/generation"] = generation_time
     metrics["time/iteration/processing"] = processing_time
     metrics["time/iteration/training"] = training_time
+    metrics["buffer/num_samples"] = buffer.num_samples
+    priority_stats = buffer.priority_stats
+    metrics["buffer/priorities/min"] = priority_stats["min"]
+    metrics["buffer/priorities/max"] = priority_stats["max"]
+    metrics["buffer/priorities/mean"] = priority_stats["mean"]
+    metrics["buffer/priorities/std"] = priority_stats["std"]
 
     return metrics
 
@@ -820,6 +861,8 @@ class KLQPERTrainer(OnPolicyTrainer):
                 query_length=query_length,
                 response_length=self.args.response_length,
                 device=self.accelerator.device,
+                sampling=self.args.buffer_sampling,
+                sampling_power=self.args.buffer_sampling_power,
             )
 
         return klq_per_batch_update(
