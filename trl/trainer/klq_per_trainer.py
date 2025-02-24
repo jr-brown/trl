@@ -213,12 +213,12 @@ class PERBuffer:
         return dtype
 
     @property
-    def num_samples(self):
+    def num_samples(self) -> int:
         """Number of rows corresponding to previous experiences."""
-        return torch.sum(~self.row_available)
+        return torch.sum(~self.row_available).item()
 
     @property
-    def priority_stats(self):
+    def priority_stats(self) -> Dict[str, float]:
         """Min, max, mean, std of priorities"""
         filtered_priorities = self.priorities[~self.row_available]
         return {
