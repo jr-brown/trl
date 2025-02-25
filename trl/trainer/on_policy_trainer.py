@@ -630,23 +630,14 @@ class OnPolicyTrainer(ABC, Trainer):
                 decoded_responses = self.processing_class.batch_decode(
                     postprocessed_query_response, skip_special_tokens=True
                 )
-#                models_final_answer_txts = [
-#                    x.split(config.final_answer_split_str)[-1]
-#                    for x in decoded_responses
-#                ]
-                # -1 if bad format, 0 if otherwise incorrect, 1 if correct
                 return torch.tensor([
                     (
                         -1.0
                         if len(ans_parts := raw_x.split(config.final_answer_split_str)) <= 1 else
                         float(y == ans_parts[-1])
-                    )
+                    ).to(self.accelerator.device)
                     for y, raw_x in zip(final_answer_txts, decoded_responses)
                 ])
-#                return torch.tensor([
-#                    float(y == yhat)
-#                    for y, yhat in zip(final_answer_txts, models_final_answer_txts)
-#                ])
 
             else:
                 raise ValueError("Need either a reward model or dataset-specified answer text in order to determine reward for answer.")
