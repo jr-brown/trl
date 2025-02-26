@@ -635,9 +635,9 @@ class OnPolicyTrainer(ABC, Trainer):
                         -1.0
                         if len(ans_parts := raw_x.split(config.final_answer_split_str)) <= 1 else
                         float(y == ans_parts[-1])
-                    ).to(self.accelerator.device)
+                    )
                     for y, raw_x in zip(final_answer_txts, decoded_responses)
-                ])
+                ]).to(self.accelerator.device)
 
             else:
                 raise ValueError("Need either a reward model or dataset-specified answer text in order to determine reward for answer.")
