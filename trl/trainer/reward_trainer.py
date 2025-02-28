@@ -210,7 +210,10 @@ class RewardTrainer(Trainer):
         if "input_ids_chosen" not in train_dataset.column_names:
             with PartialState().local_main_process_first():
                 fn_kwargs = {"tokenizer": processing_class}
-                train_dataset = train_dataset.map(maybe_apply_chat_template, fn_kwargs={"tokenizer": processing_class})
+                train_dataset = train_dataset.map(
+                    maybe_apply_chat_template,
+                    fn_kwargs={"tokenizer": processing_class},
+                )
                 train_dataset = train_dataset.map(
                     _tokenize,
                     batched=True,
@@ -226,7 +229,8 @@ class RewardTrainer(Trainer):
                 )
                 if eval_dataset is not None:
                     eval_dataset = eval_dataset.map(
-                        maybe_apply_chat_template, fn_kwargs={"tokenizer": processing_class}
+                        maybe_apply_chat_template,
+                        fn_kwargs={"tokenizer": processing_class},
                     )
                     eval_dataset = eval_dataset.map(
                         _tokenize,
