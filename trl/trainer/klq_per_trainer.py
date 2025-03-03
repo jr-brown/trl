@@ -14,6 +14,7 @@
 
 import gc
 import logging
+import math
 from typing import Dict, List, Optional, Tuple, Union, Callable
 import time
 
@@ -66,7 +67,7 @@ class KLQPERConfig(KLQConfig):
         The learning_starts parameters should *always* be greater than the replay number.
     """
 
-    local_replay_buffer_capacity: int = 250
+    buffer_pop_capacity_ratio: int = 4
     replay_rate: float = 0.5
     local_learning_starts: int = 100
     buffer_sampling: bool = False
@@ -74,6 +75,14 @@ class KLQPERConfig(KLQConfig):
     retrace: bool = True
     retrace_clip: float = 1.0
     expert_retrace_clip: float = 0.95
+
+    @property
+    def replay_number(self) -> int:
+        return math.ceil(self.replay_rate * self.local_batch_size)
+
+    @property
+    def local_replay_buffer_capacity(self) -> int:
+        return self.replay_number * self.buffer_pop_capacity_ratio
 
 
 # New code at top of file
@@ -540,9 +549,10 @@ def klq_per_batch_update(
 
     if buffer.num_samples >= config.local_learning_starts:
         per_training = True
-        replay_number = int(config.replay_rate * config.local_batch_size)
-        assert replay_number <= buffer.num_samples, "Not enough samples in buffer."
-        log.info(f"Popping batch of size {replay_number=}")
+        assert (
+            config.replay_number <= buffer.num_samples
+        ), "Not enough samples in buffer."
+        log.info(f"Popping batch of size {config.replay_number=}")
         (
             replayed_query_responses,
             replayed_responses,
@@ -551,17 +561,17 @@ def klq_per_batch_update(
             replayed_gen_logprobs,
             replayed_rewards,
             replayed_returns,
-            replayed_priorities,
+            _,  # replayed priorities # not used later so _ for happy language server
             replayed_padding_mask,
             replayed_padding_mask_plus_one,
-        ) = buffer.pop_batch(replay_number)
+        ) = buffer.pop_batch(config.replay_number)
 
     ### PER-NEW <-
 
     with torch.no_grad():
         queries = data["input_ids"].to(device)
         if per_training:
-            rollout_number = config.local_batch_size - replay_number
+            rollout_number = config.local_batch_size - config.replay_number
             queries = queries[:rollout_number]
 
         context_length = queries.shape[1]
@@ -835,6 +845,7 @@ def klq_per_batch_update(
 
 class KLQPERTrainer(OnPolicyTrainer):
     _tag_names = ["trl", "klq"]
+    args: KLQPERConfig  # Lennie: add extra type hint to help language server
 
     def __init__(
         self,
@@ -874,6 +885,14 @@ class KLQPERTrainer(OnPolicyTrainer):
             callbacks=callbacks,
         )
         self.buffer = None
+
+        # derive local buffer capacity from existing constants
+
+        # int(
+        #     config.replay_rate
+        #     * config.local_batch_size
+        #     * config.buffer_pop_capacity_ratio
+        # )
 
     def _initialise_stats(self) -> KLQPERStats:
         stats_shape = (
