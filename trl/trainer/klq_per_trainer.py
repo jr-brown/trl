@@ -78,11 +78,17 @@ class KLQPERConfig(KLQConfig):
 
     @property
     def replay_number(self) -> int:
+        """Number of samples to be popped from the buffer for each batch update"""
         return math.ceil(self.replay_rate * self.local_batch_size)
 
     @property
     def local_replay_buffer_capacity(self) -> int:
-        return self.replay_number * self.buffer_pop_capacity_ratio
+        """Max (capacity ratio times replay number, and 2 * local batch size)"""
+        # if we just take ratio times replay number we end up with 'too many' samples added
+        # to the buffer after each batch update and most history is lost
+        return (
+            self.replay_number * self.buffer_pop_capacity_ratio + self.local_batch_size
+        )
 
 
 # New code at top of file
@@ -149,7 +155,12 @@ def prioritise_batch(
 
 class PERBuffer:
     """Prioritised Experience Replay.
-    gen_logprobs are logprobs for model that generated the responses."""
+    gen_logprobs are logprobs for model that generated the responses.
+
+    - stagnancies:
+        number of turns each sample has been passed-over by the pop_batch method.
+        starts at zero then increments.
+    """
 
     def __init__(
         self,
@@ -190,6 +201,7 @@ class PERBuffer:
             (capacity, response_length), device=device, dtype=self.dtype
         )
         self.priorities = torch.zeros((capacity,), device=device, dtype=self.dtype)
+        self.stagnancies = torch.zeros((capacity,), device=device, dtype=int)
 
         # bools
         self.padding_mask = torch.zeros(
@@ -222,19 +234,48 @@ class PERBuffer:
         return dtype
 
     @property
+    def row_filled(self) -> Tensor:
+        return ~self.row_available
+
+    @property
     def num_samples(self) -> int:
         """Number of rows corresponding to previous experiences."""
-        return torch.sum(~self.row_available).item()
+        return torch.sum(self.row_filled).item()
 
     @property
     def priority_stats(self) -> Dict[str, float]:
         """Min, max, mean, std of priorities"""
-        filtered_priorities = self.priorities[~self.row_available]
+        filtered_priorities = self.priorities[self.row_filled]
+        filtered_stagnancies = self.stagnancies[self.row_filled]
+        non_zero_stag_idxs = filtered_stagnancies > 0
+        non_zero_stagnancies = filtered_stagnancies[non_zero_stag_idxs].to(dtype=float)
+        if len(non_zero_stagnancies) == 0:
+            # hack to make logging sensible despite empty tensor
+            non_zero_stagnancies = torch.zeros(size=(1,))
         return {
+            # priorities
             "min": torch.min(filtered_priorities).item(),
             "max": torch.max(filtered_priorities).item(),
             "mean": torch.mean(filtered_priorities).item(),
             "std": torch.std(filtered_priorities).item(),
+            "quantile_p25": torch.quantile(
+                filtered_priorities.to(dtype=float), 0.25
+            ).item(),
+            "quantile_p50": torch.quantile(
+                filtered_priorities.to(dtype=float), 0.50
+            ).item(),
+            "quantile_p75": torch.quantile(
+                filtered_priorities.to(dtype=float), 0.75
+            ).item(),
+            # stagnancies
+            "stagnancy_num_non_zero": torch.sum(non_zero_stag_idxs).item(),
+            "stagnancy_mean": torch.mean(non_zero_stagnancies).item(),
+            "stagnancy_std": torch.std(non_zero_stagnancies).item(),
+            "stagnancy_min": torch.min(non_zero_stagnancies).item(),
+            "stagnancy_quantile_p25": torch.quantile(non_zero_stagnancies, 0.25).item(),
+            "stagnancy_quantile_p50": torch.quantile(non_zero_stagnancies, 0.50).item(),
+            "stagnancy_quantile_p75": torch.quantile(non_zero_stagnancies, 0.75).item(),
+            "stagnancy_max": torch.max(non_zero_stagnancies).item(),
         }
 
     def add_batch(
@@ -273,6 +314,7 @@ class PERBuffer:
         self.padding_mask[idxs_to_write] = padding_mask
         self.padding_mask_plus_one[idxs_to_write] = padding_mask_plus_one
         self.row_available[idxs_to_write] = False
+        self.stagnancies[idxs_to_write] = 0
 
     def pop_batch(self, pop_batch_size: int):
         """Extracts the samples with highest priority from the buffer."""
@@ -298,6 +340,7 @@ class PERBuffer:
         padding_mask_plus_one = self.padding_mask_plus_one[idxs_to_pop]
         self.priorities[idxs_to_pop] = 0.0
         self.row_available[idxs_to_pop] = True
+        self.stagnancies += 1  # currently updating all components (but logging only takes the filled rows)
         return (
             query_responses,
             responses,
@@ -835,10 +878,31 @@ def klq_per_batch_update(
     metrics["time/iteration/training"] = training_time
     metrics["buffer/num_samples"] = buffer.num_samples
     priority_stats = buffer.priority_stats
+    # priorities
     metrics["buffer/priorities/min"] = priority_stats["min"]
     metrics["buffer/priorities/max"] = priority_stats["max"]
     metrics["buffer/priorities/mean"] = priority_stats["mean"]
     metrics["buffer/priorities/std"] = priority_stats["std"]
+    metrics["buffer/priorities/quantile_p25"] = priority_stats["quantile_p25"]
+    metrics["buffer/priorities/quantile_p50"] = priority_stats["quantile_p50"]
+    metrics["buffer/priorities/quantile_p75"] = priority_stats["quantile_p75"]
+    # stagnancies
+    metrics["buffer/stagnancies/num_non_zero"] = priority_stats[
+        "stagnancy_num_non_zero"
+    ]
+    metrics["buffer/stagnancies/mean"] = priority_stats["stagnancy_mean"]
+    metrics["buffer/stagnancies/std"] = priority_stats["stagnancy_std"]
+    metrics["buffer/stagnancies/min"] = priority_stats["stagnancy_min"]
+    metrics["buffer/stagnancies/quantile_p25"] = priority_stats[
+        "stagnancy_quantile_p25"
+    ]
+    metrics["buffer/stagnancies/quantile_p50"] = priority_stats[
+        "stagnancy_quantile_p50"
+    ]
+    metrics["buffer/stagnancies/quantile_p75"] = priority_stats[
+        "stagnancy_quantile_p75"
+    ]
+    metrics["buffer/stagnancies/max"] = priority_stats["stagnancy_max"]
 
     return metrics
 
