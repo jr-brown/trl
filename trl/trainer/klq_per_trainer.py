@@ -77,17 +77,18 @@ class KLQPERConfig(KLQConfig):
     expert_retrace_clip: float = 0.95
 
     @property
-    def replay_number(self) -> int:
+    def _replay_number(self) -> int:
         """Number of samples to be popped from the buffer for each batch update"""
         return math.ceil(self.replay_rate * self.local_batch_size)
 
     @property
-    def local_replay_buffer_capacity(self) -> int:
-        """Max (capacity ratio times replay number, and 2 * local batch size)"""
+    def _local_replay_buffer_capacity(self) -> int:
+        """Sum of (capacity ratio times replay number) and local batch size)"""
         # if we just take ratio times replay number we end up with 'too many' samples added
         # to the buffer after each batch update and most history is lost
         return (
-            self.replay_number * self.buffer_pop_capacity_ratio + self.local_batch_size
+            math.ceil(self.replay_number * self.buffer_pop_capacity_ratio)
+            + self.local_batch_size
         )
 
 
@@ -950,13 +951,13 @@ class KLQPERTrainer(OnPolicyTrainer):
         )
         self.buffer = None
 
-        # derive local buffer capacity from existing constants
+        # add buffer capacity constants as attributes for wandb logging
+        self.args.replay_number = self.args._replay_number
+        self.args.local_replay_buffer_capacity = self.args._local_replay_buffer_capacity
 
-        # int(
-        #     config.replay_rate
-        #     * config.local_batch_size
-        #     * config.buffer_pop_capacity_ratio
-        # )
+        # (the attributes will be accessed rather than the properties in future.
+        # ? Possibly worth changing both this and the OnPolicyConfig to use post_init rather than
+        # the big chunk of config processing code in on_policy_trainer)
 
     def _initialise_stats(self) -> KLQPERStats:
         stats_shape = (
