@@ -76,20 +76,32 @@ class KLQPERConfig(KLQConfig):
     retrace_clip: float = 1.0
     expert_retrace_clip: float = 0.95
 
-    @property
-    def _replay_number(self) -> int:
-        """Number of samples to be popped from the buffer for each batch update"""
-        return math.ceil(self.replay_rate * self.local_batch_size)
+    # derived constants to be overwritten in the post_init
+    replay_number: int = 0
+    local_replay_buffer_capacity: int = 0
 
-    @property
-    def _local_replay_buffer_capacity(self) -> int:
-        """Sum of (capacity ratio times replay number) and local batch size)"""
-        # if we just take ratio times replay number we end up with 'too many' samples added
-        # to the buffer after each batch update and most history is lost
-        return (
-            math.ceil(self.replay_number * self.buffer_pop_capacity_ratio)
-            + self.local_batch_size
+    def __post_init__(self):
+        super().__post_init__()
+        # Calculate derived values
+        self.replay_number = math.ceil(self.replay_rate * self.local_batch_size)
+        self.local_replay_buffer_capacity = (
+            self.replay_number * self.buffer_pop_capacity_ratio + self.local_batch_size
         )
+
+    # @property
+    # def _replay_number(self) -> int:
+    #     """Number of samples to be popped from the buffer for each batch update"""
+    #     return math.ceil(self.replay_rate * self.local_batch_size)
+
+    # @property
+    # def _local_replay_buffer_capacity(self) -> int:
+    #     """Sum of (capacity ratio times replay number) and local batch size)"""
+    #     # if we just take ratio times replay number we end up with 'too many' samples added
+    #     # to the buffer after each batch update and most history is lost
+    #     return (
+    #         math.ceil(self.replay_number * self.buffer_pop_capacity_ratio)
+    #         + self.local_batch_size
+    #     )
 
 
 # New code at top of file
@@ -952,8 +964,8 @@ class KLQPERTrainer(OnPolicyTrainer):
         self.buffer = None
 
         # add buffer capacity constants as attributes for wandb logging
-        self.args.replay_number = self.args._replay_number
-        self.args.local_replay_buffer_capacity = self.args._local_replay_buffer_capacity
+        # self.args.replay_number = self.args._replay_number
+        # self.args.local_replay_buffer_capacity = self.args._local_replay_buffer_capacity
 
         # (the attributes will be accessed rather than the properties in future.
         # ? Possibly worth changing both this and the OnPolicyConfig to use post_init rather than

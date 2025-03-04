@@ -294,6 +294,8 @@ class OnPolicyTrainer(ABC, Trainer):
         #########
         # calculate various batch sizes
         #########
+        # NOTE: moved config.local_batch_size definition to config post_init
+        # other derived quantities require num_processes information so can't be pulled out
 
         # One "episode" is one prompt-completion pair
         if (
@@ -306,11 +308,6 @@ class OnPolicyTrainer(ABC, Trainer):
         # The number of processes we're using
         config.world_size = accelerator.num_processes
 
-        config.local_batch_size = (
-            config.per_device_train_batch_size
-            * config.gradient_accumulation_steps
-            * config.num_mini_batches
-        )
         # Total batch size across all processes
         config.micro_batch_size = int(
             config.per_device_train_batch_size * config.world_size

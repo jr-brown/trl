@@ -110,6 +110,18 @@ class OnPolicyConfig(TrainingArguments):
     lam_episode_length: Optional[int] = None
     lam_schedule_type: str = "linear"
 
+    # Attributes derived in post_init
+    local_batch_size: int = None
+
+    def __post_init__(self):
+        """Define certain derived attributes."""
+        super().__post_init__()
+        self.local_batch_size = (
+            self.per_device_train_batch_size
+            * self.gradient_accumulation_steps
+            * self.num_mini_batches
+        )
+
 
 def retokenize(
     input_ids: torch.Tensor,
