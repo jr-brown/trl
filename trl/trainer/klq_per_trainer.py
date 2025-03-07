@@ -85,23 +85,8 @@ class KLQPERConfig(KLQConfig):
         # Calculate derived values
         self.replay_number = math.ceil(self.replay_rate * self.local_batch_size)
         self.local_replay_buffer_capacity = (
-            self.replay_number * self.buffer_pop_capacity_ratio + self.local_batch_size
+            self.replay_number * self.buffer_pop_capacity_ratio
         )
-
-    # @property
-    # def _replay_number(self) -> int:
-    #     """Number of samples to be popped from the buffer for each batch update"""
-    #     return math.ceil(self.replay_rate * self.local_batch_size)
-
-    # @property
-    # def _local_replay_buffer_capacity(self) -> int:
-    #     """Sum of (capacity ratio times replay number) and local batch size)"""
-    #     # if we just take ratio times replay number we end up with 'too many' samples added
-    #     # to the buffer after each batch update and most history is lost
-    #     return (
-    #         math.ceil(self.replay_number * self.buffer_pop_capacity_ratio)
-    #         + self.local_batch_size
-    #     )
 
 
 # New code at top of file
@@ -164,6 +149,56 @@ def prioritise_batch(
     priorities = masked_mean(Deltas**2, ~padding_mask_plus_one, axis=1)
     # Take mean over the length dimension, not batch dimension
     return priorities, returns
+
+
+def select_best_elements(t1: Tensor, t2: Tensor) -> Tuple[Tensor, Tensor]:
+    """Return tuple of boolean tensors consisting of the highest-valued elements.
+    Takes in two one-dimensional float-valued tensors t1 and t2.
+    The true elements of the returned tensor pair define the top len(t1) total
+    elements to extract from the two tensors.
+    """
+    assert len(t1.shape) == len(t2.shape) == 1, f"Both tensors must be 1 dimensional"
+    num_to_select = t1.shape[0]
+    combined_values = torch.cat([t1, t2], dim=0)
+    sorted_indices = torch.argsort(combined_values, descending=True)
+    masks = torch.zeros_like(combined_values, dtype=bool)
+    indices_to_select = sorted_indices[:num_to_select]
+    masks[indices_to_select] = True
+    t1_mask, t2_mask = (
+        masks[:num_to_select],
+        masks[num_to_select:],
+    )
+    return t1_mask, t2_mask
+
+
+def test_select_best_elements():
+    # Test 1: Equal values in both tensors
+    t1 = torch.tensor([1.0, 2.0, 3.0])
+    t2 = torch.tensor([4.0, 5.0, 6.0])
+    m1, m2 = select_best_elements(t1, t2)
+    assert torch.equal(m1, torch.tensor([False, False, False])), f"{m1=}"
+    assert torch.equal(m2, torch.tensor([True, True, True])), f"{m2=}"
+
+    # Test 2: Interleaved values
+    t1 = torch.tensor([1.0, 3.0, 5.0])
+    t2 = torch.tensor([2.0, 4.0, 6.0])
+    m1, m2 = select_best_elements(t1, t2)
+    assert torch.equal(m1, torch.tensor([False, False, True])), f"{m1=}"
+    assert torch.equal(m2, torch.tensor([False, True, True])), f"{m2=}"
+
+    # Test 3: All best values in t1
+    t1 = torch.tensor([4.0, 5.0, 6.0])
+    t2 = torch.tensor([1.0, 2.0, 3.0])
+    m1, m2 = select_best_elements(t1, t2)
+    assert torch.equal(m1, torch.tensor([True, True, True])), f"{m1=}"
+    assert torch.equal(m2, torch.tensor([False, False, False])), f"{m2=}"
+
+    # Test 4: Different tensor lengths
+    t1 = torch.tensor([1.0, 5.0])
+    t2 = torch.tensor([2.0, 3.0, 4.0, 6.0])
+    m1, m2 = select_best_elements(t1, t2)
+    assert torch.equal(m1, torch.tensor([False, True])), f"{m1=}"
+    assert torch.equal(m2, torch.tensor([False, False, False, True])), f"{m2=}"
 
 
 class PERBuffer:
@@ -313,21 +348,26 @@ class PERBuffer:
             priorities > 0
         ).all(), f"All priorities should be strictly positive {priorities=}"
 
-        # newer simpler way to choose which indices: simply those with the lowest priority
-        idxs_to_write = torch.argsort(self.priorities)[:num_samples_in]
+        # # newer simpler way to choose which indices: simply those with the lowest priority
+        # idxs_to_write = torch.argsort(self.priorities)[:num_samples_in]
 
-        self.query_responses[idxs_to_write] = query_responses
-        self.responses[idxs_to_write] = responses
-        self.state_values[idxs_to_write] = state_values.to(dtype=self.dtype)
-        self.ref_logprobs[idxs_to_write] = ref_logprobs.to(dtype=self.dtype)
-        self.gen_logprobs[idxs_to_write] = gen_logprobs.to(dtype=self.dtype)
-        self.rewards[idxs_to_write] = rewards.to(dtype=self.dtype)
-        self.returns[idxs_to_write] = returns.to(dtype=self.dtype)
-        self.priorities[idxs_to_write] = priorities.to(dtype=self.dtype)
-        self.padding_mask[idxs_to_write] = padding_mask
-        self.padding_mask_plus_one[idxs_to_write] = padding_mask_plus_one
-        self.row_available[idxs_to_write] = False
-        self.stagnancies[idxs_to_write] = 0
+        # obtain indices to keep from existing and incoming tensors
+        keep_existing, add_new = select_best_elements(self.priorities, priorities)
+        replace_existing = ~keep_existing
+        assert sum(add_new) == sum(replace_existing), f"Need same number of incoming and outgoing values"
+
+        self.query_responses[replace_existing] = query_responses[add_new]
+        self.responses[replace_existing] = responses[add_new]
+        self.state_values[replace_existing] = state_values.to(dtype=self.dtype)[add_new]
+        self.ref_logprobs[replace_existing] = ref_logprobs.to(dtype=self.dtype)[add_new]
+        self.gen_logprobs[replace_existing] = gen_logprobs.to(dtype=self.dtype)[add_new]
+        self.rewards[replace_existing] = rewards.to(dtype=self.dtype)[add_new]
+        self.returns[replace_existing] = returns.to(dtype=self.dtype)[add_new]
+        self.priorities[replace_existing] = priorities.to(dtype=self.dtype)[add_new]
+        self.padding_mask[replace_existing] = padding_mask[add_new]
+        self.padding_mask_plus_one[replace_existing] = padding_mask_plus_one[add_new]
+        self.row_available[replace_existing] = False
+        self.stagnancies[replace_existing] = 0
 
     def pop_batch(self, pop_batch_size: int):
         """Extracts the samples with highest priority from the buffer."""
