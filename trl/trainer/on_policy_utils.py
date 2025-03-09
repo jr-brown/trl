@@ -293,7 +293,7 @@ def rollouts_to_loss_variables(
 
         if response_truncation_sequences is not None:
             postprocessed_response = truncate_response_from_sequences(
-                response_truncation_sequences, pad_token_id, response
+                response_truncation_sequences, pad_token_id, postprocessed_response
             )
 
         # Response Processing 2. run reward model on the truncated responses
