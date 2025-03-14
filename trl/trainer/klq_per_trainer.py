@@ -68,8 +68,8 @@ class KLQPERConfig(KLQConfig):
     """
 
     buffer_pop_capacity_ratio: int = 4
+    buffer_learning_start_fraction: float = 0.5
     replay_rate: float = 0.5
-    local_learning_starts: int = 100
     buffer_sampling: bool = False
     buffer_sampling_power: float = 0.5
     retrace: bool = True
@@ -79,6 +79,7 @@ class KLQPERConfig(KLQConfig):
     # derived constants to be overwritten in the post_init
     replay_number: int = 0
     local_replay_buffer_capacity: int = 0
+    local_learning_starts: int = 0
 
     def __post_init__(self):
         super().__post_init__()
@@ -86,6 +87,9 @@ class KLQPERConfig(KLQConfig):
         self.replay_number = math.ceil(self.replay_rate * self.local_batch_size)
         self.local_replay_buffer_capacity = (
             self.replay_number * self.buffer_pop_capacity_ratio
+        )
+        self.local_learning_starts = int(
+            self.local_replay_buffer_capacity * self.buffer_learning_start_fraction
         )
 
 
@@ -342,8 +346,6 @@ class PERBuffer:
         """Add a batch of samples to the buffer."""
         # NOTE: could read device from query_responses etc also
         # if there are insufficient empty rows, mark the lowest priority rows for overwrite
-        num_samples_in = query_responses.shape[0]
-
         assert (
             priorities > 0
         ).all(), f"All priorities should be strictly positive {priorities=}"
@@ -354,7 +356,9 @@ class PERBuffer:
         # obtain indices to keep from existing and incoming tensors
         keep_existing, add_new = select_best_elements(self.priorities, priorities)
         replace_existing = ~keep_existing
-        assert sum(add_new) == sum(replace_existing), f"Need same number of incoming and outgoing values"
+        assert sum(add_new) == sum(
+            replace_existing
+        ), f"Need same number of incoming and outgoing values"
 
         self.query_responses[replace_existing] = query_responses[add_new]
         self.responses[replace_existing] = responses[add_new]
@@ -1002,14 +1006,6 @@ class KLQPERTrainer(OnPolicyTrainer):
             callbacks=callbacks,
         )
         self.buffer = None
-
-        # add buffer capacity constants as attributes for wandb logging
-        # self.args.replay_number = self.args._replay_number
-        # self.args.local_replay_buffer_capacity = self.args._local_replay_buffer_capacity
-
-        # (the attributes will be accessed rather than the properties in future.
-        # ? Possibly worth changing both this and the OnPolicyConfig to use post_init rather than
-        # the big chunk of config processing code in on_policy_trainer)
 
     def _initialise_stats(self) -> KLQPERStats:
         stats_shape = (
