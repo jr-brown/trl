@@ -78,6 +78,7 @@ class KLQPERConfig(KLQConfig):
 
     # derived constants to be overwritten in the post_init
     replay_number: int = 0
+    rollout_number: int = 0
     local_replay_buffer_capacity: int = 0
     local_learning_starts: int = 0
 
@@ -91,6 +92,10 @@ class KLQPERConfig(KLQConfig):
         self.local_learning_starts = int(
             self.local_replay_buffer_capacity * self.buffer_learning_start_fraction
         )
+        self.rollout_number = self.local_batch_size - self.replay_number
+
+        assert self.rollout_number > 0, f"{self.rollout_number=} must be greater than 0"
+        assert self.replay_number > 0, f"{self.replay_number=} must be greater than 0"
 
 
 # New code at top of file
@@ -688,10 +693,9 @@ def klq_per_batch_update(
             maybe_answer_ids = maybe_answer_ids.to(device)
 
         if per_training:
-            rollout_number = config.local_batch_size - config.replay_number
-            queries = queries[:rollout_number]
+            queries = queries[: config.rollout_number]
             if maybe_answer_ids is not None:
-                maybe_answer_ids = maybe_answer_ids[:rollout_number]
+                maybe_answer_ids = maybe_answer_ids[: config.rollout_number]
         context_length = queries.shape[1]
 
         # Run AR Generation on the *new* queries
