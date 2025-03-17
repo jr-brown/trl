@@ -317,18 +317,17 @@ def calc_ref_logprob(
 def rollouts_to_loss_variables(
     queries,
     query_responses,
+    maybe_answer_ids,
     logitss,
     ref_policy,
     unwrapped_value_model,
-    reward_model,
     processing_class,
-    reward_model_processing_class,
     context_length,
     stop_token_id,
     response_truncation_sequences: list[list[int]],
     local_rollout_forward_batch_size,
     ref_temperature,
-    device,
+    scoring_function,
 ):
     """
     Takes in an iteration batch of queries and responses, and computes various variables needed for defining the loss function.
@@ -402,7 +401,7 @@ def rollouts_to_loss_variables(
 
         if response_truncation_sequences is not None:
             postprocessed_response = truncate_response_from_sequences(
-                response_truncation_sequences, pad_token_id, response
+                response_truncation_sequences, pad_token_id, postprocessed_response
             )
 
         # Response Processing 2. run reward model on the truncated responses
@@ -422,19 +421,8 @@ def rollouts_to_loss_variables(
         )
         # Extract only the value estimates for the completion
         state_value = full_value[:, context_length - 1 : -1].squeeze(-1)
-        # The score is the reward at the end of each query sequence.
-        # score has shape [batch]
-        reward_model_inputs, reward_model_pad_token = retokenize(
-            postprocessed_query_response,
-            device,
-            processing_class,
-            reward_model_processing_class,
-        )
-        score = get_just_reward(
-            reward_model,
-            reward_model_inputs,
-            reward_model_pad_token,
-        )
+
+        score = scoring_function(postprocessed_query_response, maybe_answer_ids)
 
         # This is just a bunch of logging stuff
         responses.append(response)
@@ -463,6 +451,102 @@ def rollouts_to_loss_variables(
         scores,
         state_values,
     )
+
+
+@dataclass
+class OnPolicyConfig(TrainingArguments):
+    r"""
+    Base configuration class for on-policy trainers.
+
+    Using [`~transformers.HfArgumentParser`] we can turn this class into
+    [argparse](https://docs.python.org/3/library/argparse#module-argparse) arguments that can be specified on the
+    command line.
+
+    Parameters:
+        run_name (`Optional[str]`, *optional*, defaults to `None`):
+            Name of the run.
+        dataset_num_proc (`Optional[int]`, *optional*, defaults to `None`):
+            Number of processes to use for processing the dataset.
+        num_mini_batches (`int`, *optional*, defaults to `1`):
+            Number of minibatches to split a batch into.
+        total_episodes (`Optional[int]`, *optional*, defaults to `None`):
+            Total number of episodes in the dataset.
+        local_rollout_forward_batch_size (`int`, *optional*, defaults to `64`):
+            Per rank no grad forward pass in the rollout phase.
+        num_sample_generations (`int`, *optional*, defaults to `10`):
+            Number of debugging samples generations (i.e., `generate_eval_completions` calls) throughout training.
+        max_num_eval_batches (`Optional[int]`, defaults to `1`):
+            Maximum number of batches to be used when sampling eval generations. If set to None, will iterate through the entire eval dataset.
+        response_length (`int`, *optional*, defaults to `53`):
+            Length of the response.
+        stop_token (`Optional[str]`, *optional*, defaults to `None`):
+            Stop token.
+        stop_token_id (`Optional[int]`, *optional*, defaults to `None`):
+            Truncation token id.
+        response_truncation_sequences (`[List[List[int]]]`, *optional*, defaults to `None`):
+            Stop strings for generations from the model.
+        train_temperature (`float`, *optional*, defaults to `1.0`):
+            Used to divide logits when training model.
+        train_rollout_temperature (`float`, *optional*, defaults to `1.0`):
+            Sampling temperature.
+        eval_rollout_temperature (`float`, *optional*, defaults to `1.0`):
+            Sampling temperature for evaluation.
+        missing_eos_penalty (`Optional[float]`, *optional*, defaults to `None`):
+            Penalty applied to the score when the model fails to generate an EOS token. This is useful to encourage
+            to generate completions shorter than the maximum length (`max_new_tokens`). The penalty must be a positive
+            value.
+        sft_model_path (`str`, *optional*, defaults to `"EleutherAI/pythia-160m"`):
+            Path to the SFT model.
+        world_size (`Optional[int]`, *optional*, defaults to `None`):
+            Number of processes (GPUs) to use for the training.
+        num_total_batches (`Optional[int]`, *optional*, defaults to `None`):
+            Number of total batches to train.
+        micro_batch_size (`Optional[int]`, *optional*, defaults to `None`):
+            Micro batch size across devices (HF's `per_device_train_batch_size` * `world_size`).
+        local_batch_size (`Optional[int]`, *optional*, defaults to `None`):
+            Batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`).
+        batch_size (`Optional[int]`, *optional*, defaults to `None`):
+            Batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`).
+        local_mini_batch_size (`Optional[int]`, *optional*, defaults to `None`):
+            Mini batch size per GPU.
+        mini_batch_size (`Optional[int]`, *optional*, defaults to `None`):
+            Mini batch size across GPUs.
+        push_to_hub (`bool`, *optional*, defaults to `False`):
+            Whether to push the model to the Hub after training.
+    """
+
+    run_name: Optional[str] = None
+    dataset_num_proc: Optional[int] = None
+    num_mini_batches: int = 1
+    total_episodes: Optional[int] = None
+    local_rollout_forward_batch_size: int = 64
+    num_sample_generations: int = 10
+    max_num_eval_batches: Optional[int] = 1
+    response_length: int = 53
+    stop_token: Optional[Literal["eos"]] = None
+    stop_token_id: Optional[int] = None
+    response_truncation_sequences: Optional[List[List[int]]] = None
+    train_temperature: float = 1.0
+    train_rollout_temperature: float = 1.0
+    eval_rollout_temperature: float = 1.0
+    missing_eos_penalty: Optional[float] = None
+    sft_model_path: str = "EleutherAI/pythia-160m"
+    reward_model_path: str | None = None
+    world_size: Optional[int] = None
+    num_total_batches: Optional[int] = None
+    micro_batch_size: Optional[int] = None
+    local_batch_size: Optional[int] = None
+    batch_size: Optional[int] = None
+    local_mini_batch_size: Optional[int] = None
+    mini_batch_size: Optional[int] = None
+    push_to_hub: bool = False
+    time_limit_mins: Optional[float] = None
+    # Parameters
+    lam: float = 0.95
+    final_lam: Optional[float] = None
+    lam_episode_length: Optional[int] = None
+    lam_schedule_type: str = "linear"
+    final_answer_split_str: str | None = None
 
 
 def forward_pass_on_rollouts(

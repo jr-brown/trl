@@ -210,6 +210,7 @@ class KLQStats:
     def __init__(self, stats_shape: Tuple[int, int, int], device: torch.device) -> None:
         self.loss_function_stats = torch.zeros(stats_shape, device=device)
         self.action_value_stats = torch.zeros(stats_shape, device=device)
+        self.state_value_error_stats = torch.zeros(stats_shape, device=device)
         self.state_value_stats = torch.zeros(stats_shape, device=device)
         self.advantage_stats = torch.zeros(stats_shape, device=device)
         # self.log_ratio_new_ref_stats = torch.zeros(stats_shape, device=device)
@@ -224,6 +225,7 @@ class KLQStats:
         update_location: Tuple[int, int, int],
         action_value_function_loss,
         action_value_prediction,
+        state_value_error,
         state_value_prediction,
         # new_ref_log_ratio,
         entropy,
@@ -234,6 +236,7 @@ class KLQStats:
     ):
         self.loss_function_stats[update_location] = action_value_function_loss
         self.action_value_stats[update_location] = action_value_prediction
+        self.state_value_error_stats[update_location] = state_value_error
         self.state_value_stats[update_location] = state_value_prediction
         self.advantage_stats[update_location] = (
             action_value_prediction - state_value_prediction
@@ -273,6 +276,7 @@ def micro_batch_updates(
     mini_batch_end = mini_batch_start + config.local_mini_batch_size
     mini_batch_inds = batch_inds[mini_batch_start:mini_batch_end]
     gradient_accumulation_idx = 0
+
     for micro_batch_start in range(
         0, config.local_mini_batch_size, config.per_device_train_batch_size
     ):
@@ -342,6 +346,11 @@ def micro_batch_updates(
             action_value_function_loss = masked_mean(
                 action_value_function_losses, ~padding_mask_plus_one[micro_batch_inds]
             )
+
+            # Compute state_value error for logging
+            state_value_errors = torch.square(state_value_prediction - micro_batch_return)
+            state_value_error = masked_mean(state_value_errors, ~padding_mask[micro_batch_inds])
+
             # Perform the update step.
             accelerator.backward(action_value_function_loss)
             optimizer.step()
@@ -383,6 +392,7 @@ def micro_batch_updates(
                     update_location,
                     action_value_function_loss=action_value_function_loss,
                     action_value_prediction=mean_action_value_prediction,
+                    state_value_error=state_value_error,
                     state_value_prediction=mean_state_value_prediction,
                     # new_ref_log_ratio=new_ref_log_ratio.sum(1).mean(),
                     entropy=avg_entropy,
@@ -398,8 +408,8 @@ def micro_batch_updates(
 def klq_batch_update(
     config: KLQConfig,
     generation_config,
+    scoring_function,
     processing_class,
-    reward_model_processing_class,
     # optimisation / performance
     optimizer,
     accelerator,
@@ -407,7 +417,6 @@ def klq_batch_update(
     # stateful parameters to be updated
     model,
     ref_policy,
-    reward_model,
     klq_stats: KLQStats,
     # data for the this batch!
     data: Dict[str, Tensor],
@@ -419,7 +428,13 @@ def klq_batch_update(
 
     with torch.no_grad():
         queries = data["input_ids"].to(device)
+        maybe_answer_ids = data.get("answer_ids")
+
+        if maybe_answer_ids is not None:
+            maybe_answer_ids = maybe_answer_ids.to(device)
+
         context_length = queries.shape[1]
+
         with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
             # query_respones and logitss are both torch Tensors.
             # query_responses has shape [batch, query_length]
@@ -445,18 +460,17 @@ def klq_batch_update(
         ) = rollouts_to_loss_variables(
             queries=queries,
             query_responses=query_responses,
+            maybe_answer_ids=maybe_answer_ids,
             logitss=logitss,
             ref_policy=ref_policy,
             unwrapped_value_model=accelerator.unwrap_model(model).value_model,
-            reward_model=reward_model,
             processing_class=processing_class,
-            reward_model_processing_class=reward_model_processing_class,
             context_length=context_length,
             stop_token_id=config.stop_token_id,
             response_truncation_sequences=config.response_truncation_sequences,
             local_rollout_forward_batch_size=config.local_rollout_forward_batch_size,
             ref_temperature=config.train_temperature,
-            device=device,
+            scoring_function=scoring_function,
         )
         action_values = config.kl_coef * (logprobs - ref_logprobs) + state_values
         torch.cuda.empty_cache()
@@ -620,6 +634,7 @@ def klq_batch_update(
             "loss/token/action_value_loss": s.loss_function_stats,
             #
             "value_function/token/state_value": s.state_value_stats,
+            "value_function/token/state_value_error": s.state_value_error_stats,
             "value_function/token/action_value": s.action_value_stats,
             "value_function/token/advantage": s.advantage_stats,
         }
@@ -692,13 +707,14 @@ class KLQTrainer(OnPolicyTrainer):
     def _batch_update(
         self,
         data: Dict[str, torch.Tensor],
+        scoring_function: Callable,
     ) -> Dict[str, float]:
         return klq_batch_update(
             # config-like and tokenizers
             config=self.args,
             generation_config=self.train_generation_config,
+            scoring_function=scoring_function,
             processing_class=self.processing_class,
-            reward_model_processing_class=self.reward_model_processing_class,
             # optimisation / performance
             optimizer=self.optimizer,
             accelerator=self.accelerator,
@@ -706,7 +722,6 @@ class KLQTrainer(OnPolicyTrainer):
             # stateful models and stats to be updated
             model=self.model,
             ref_policy=self.ref_policy,
-            reward_model=self.reward_model,
             klq_stats=self.stats,
             # data for this batch!
             data=data,
