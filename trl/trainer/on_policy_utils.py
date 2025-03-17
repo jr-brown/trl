@@ -453,6 +453,60 @@ def rollouts_to_loss_variables(
     )
 
 
+def forward_pass_on_rollouts(
+    config: OnPolicyConfig,  # to do add local_rollout from config
+    model,
+    query_responses,
+    local_rollout_forward_batch_size,
+    context_length,  # query context length or something
+    pad_token_id,
+    padding_mask,
+    padding_mask_plus_one,
+    ref_logprobs,
+):
+    """L&E constructed this by lifting code from klq_micro_batch_updates.
+    And then combining with on_policy_utils/calc_ref_logprob.
+
+    For now this is 'written', but expect many bugs."""
+    new_logprobs_list = []
+    new_state_values_list = []
+
+    for i in range(0, query_responses.shape[0], local_rollout_forward_batch_size):
+        local_rollout_indices = slice(i, i + local_rollout_forward_batch_size)
+        query_response = query_responses[local_rollout_indices]
+        response = query_response[:, context_length:]
+        # note: might be able to pass in the responses directly
+
+        # Extract the query
+        output, state_value_prediction_temporary = forward(
+            model, query_response, pad_token_id
+        )
+        logits = output.logits[:, context_length - 1 : -1]
+        logits /= config.train_temperature + 1e-7
+        new_all_logprobs = F.log_softmax(logits, dim=-1)
+        new_logprobs = torch.gather(
+            new_all_logprobs, 2, response.unsqueeze(-1)
+        ).squeeze(-1)
+        new_logprobs = torch.masked_fill(
+            new_logprobs, padding_mask[local_rollout_indices], INVALID_LOGPROB
+        )
+
+        # Compute inputs to loss function
+        state_value_prediction = state_value_prediction_temporary[
+            :, context_length - 1 : -1
+        ].squeeze(-1)
+        state_value_prediction = torch.masked_fill(
+            state_value_prediction, padding_mask_plus_one[local_rollout_indices], 0
+        )
+
+        new_logprobs_list.append(new_logprobs)
+        new_state_values_list.append(state_value_prediction)
+
+    new_logprobs = torch.cat(new_logprobs_list, 0)
+    state_value_prediction = torch.cat(new_state_values_list, 0)
+    return new_logprobs, state_value_prediction
+
+
 @dataclass
 class OnPolicyConfig(TrainingArguments):
     r"""
@@ -547,57 +601,3 @@ class OnPolicyConfig(TrainingArguments):
     lam_episode_length: Optional[int] = None
     lam_schedule_type: str = "linear"
     final_answer_split_str: str | None = None
-
-
-def forward_pass_on_rollouts(
-    config: OnPolicyConfig,  # to do add local_rollout from config
-    model,
-    query_responses,
-    local_rollout_forward_batch_size,
-    context_length,  # query context length or something
-    pad_token_id,
-    padding_mask,
-    padding_mask_plus_one,
-    ref_logprobs,
-):
-    """L&E constructed this by lifting code from klq_micro_batch_updates.
-    And then combining with on_policy_utils/calc_ref_logprob.
-
-    For now this is 'written', but expect many bugs."""
-    new_logprobs_list = []
-    new_state_values_list = []
-
-    for i in range(0, query_responses.shape[0], local_rollout_forward_batch_size):
-        local_rollout_indices = slice(i, i + local_rollout_forward_batch_size)
-        query_response = query_responses[local_rollout_indices]
-        response = query_response[:, context_length:]
-        # note: might be able to pass in the responses directly
-
-        # Extract the query
-        output, state_value_prediction_temporary = forward(
-            model, query_response, pad_token_id
-        )
-        logits = output.logits[:, context_length - 1 : -1]
-        logits /= config.train_temperature + 1e-7
-        new_all_logprobs = F.log_softmax(logits, dim=-1)
-        new_logprobs = torch.gather(
-            new_all_logprobs, 2, response.unsqueeze(-1)
-        ).squeeze(-1)
-        new_logprobs = torch.masked_fill(
-            new_logprobs, padding_mask[local_rollout_indices], INVALID_LOGPROB
-        )
-
-        # Compute inputs to loss function
-        state_value_prediction = state_value_prediction_temporary[
-            :, context_length - 1 : -1
-        ].squeeze(-1)
-        state_value_prediction = torch.masked_fill(
-            state_value_prediction, padding_mask_plus_one[local_rollout_indices], 0
-        )
-
-        new_logprobs_list.append(new_logprobs)
-        new_state_values_list.append(state_value_prediction)
-
-    new_logprobs = torch.cat(new_logprobs_list, 0)
-    state_value_prediction = torch.cat(new_state_values_list, 0)
-    return new_logprobs, state_value_prediction
