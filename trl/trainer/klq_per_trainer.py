@@ -417,6 +417,7 @@ class KLQPERStats:
         self.loss_function_stats = torch.zeros(stats_shape, device=device)
         self.action_value_stats = torch.zeros(stats_shape, device=device)
         self.state_value_stats = torch.zeros(stats_shape, device=device)
+        self.state_value_error_stats = torch.zeros(stats_shape, device=device)
         self.advantage_stats = torch.zeros(stats_shape, device=device)
         # self.log_ratio_new_ref_stats = torch.zeros(stats_shape, device=device)
         self.entropy_stats = torch.zeros(stats_shape, device=device)
@@ -431,6 +432,7 @@ class KLQPERStats:
         action_value_function_loss,
         action_value_prediction,
         state_value_prediction,
+        state_value_error,
         # new_ref_log_ratio,
         entropy,
         prev_ref_log_ratio,
@@ -441,6 +443,7 @@ class KLQPERStats:
         self.loss_function_stats[update_location] = action_value_function_loss
         self.action_value_stats[update_location] = action_value_prediction
         self.state_value_stats[update_location] = state_value_prediction
+        self.state_value_error_stats[update_location] = state_value_error
         self.advantage_stats[update_location] = (
             action_value_prediction - state_value_prediction
         )
@@ -557,6 +560,15 @@ def klq_per_micro_batch_updates(
             action_value_function_loss = masked_mean(
                 action_value_function_losses, ~padding_mask_plus_one[micro_batch_inds]
             )
+
+            # Compute state_value error for logging
+            state_value_errors = torch.square(
+                state_value_prediction - micro_batch_return
+            )
+            state_value_error = masked_mean(
+                state_value_errors, ~padding_mask[micro_batch_inds]
+            )
+
             # Perform the update step.
             accelerator.backward(action_value_function_loss)
             optimizer.step()
@@ -599,6 +611,7 @@ def klq_per_micro_batch_updates(
                     action_value_function_loss=action_value_function_loss,
                     action_value_prediction=mean_action_value_prediction,
                     state_value_prediction=mean_state_value_prediction,
+                    state_value_error=state_value_error,
                     # new_ref_log_ratio=new_ref_log_ratio.sum(1).mean(),
                     entropy=avg_entropy,
                     prev_ref_log_ratio=prev_ref_log_ratio.sum(
@@ -617,8 +630,8 @@ def klq_per_micro_batch_updates(
 def klq_per_batch_update(
     config: KLQPERConfig,
     generation_config,
+    scoring_function,
     processing_class,
-    reward_model_processing_class,
     # optimisation / performance
     optimizer,
     accelerator,
@@ -626,7 +639,6 @@ def klq_per_batch_update(
     # stateful parameters to be updated
     model,
     ref_policy,
-    reward_model,
     klq_stats: KLQPERStats,
     # data for the this batch!
     buffer: PERBuffer,
@@ -670,11 +682,19 @@ def klq_per_batch_update(
 
     with torch.no_grad():
         queries = data["input_ids"].to(device)
+        maybe_answer_ids = data.get("answer_ids")
+
+        if maybe_answer_ids is not None:
+            maybe_answer_ids = maybe_answer_ids.to(device)
+
         if per_training:
             rollout_number = config.local_batch_size - config.replay_number
             queries = queries[:rollout_number]
-
+            if maybe_answer_ids is not None:
+                maybe_answer_ids = maybe_answer_ids[:rollout_number]
         context_length = queries.shape[1]
+
+        # Run AR Generation on the *new* queries
         with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
             # query_respones and logitss are both torch Tensors.
             # query_responses has shape [batch, query_length]
@@ -700,18 +720,17 @@ def klq_per_batch_update(
         ) = rollouts_to_loss_variables(
             queries=queries,
             query_responses=query_responses,
+            maybe_answer_ids=maybe_answer_ids,
             logitss=logitss,
             ref_policy=ref_policy,
             unwrapped_value_model=accelerator.unwrap_model(model).value_model,
-            reward_model=reward_model,
             processing_class=processing_class,
-            reward_model_processing_class=reward_model_processing_class,
             context_length=context_length,
             stop_token_id=config.stop_token_id,
             response_truncation_sequences=config.response_truncation_sequences,
             local_rollout_forward_batch_size=config.local_rollout_forward_batch_size,
             ref_temperature=config.train_temperature,
-            device=device,
+            scoring_function=scoring_function,
         )
         action_values = config.kl_coef * (gen_logprobs - ref_logprobs) + state_values
         torch.cuda.empty_cache()
@@ -917,6 +936,7 @@ def klq_per_batch_update(
             "loss/token/action_value_loss": s.loss_function_stats,
             #
             "value_function/token/state_value": s.state_value_stats,
+            "value_function/token/state_value_error": s.state_value_error_stats,
             "value_function/token/action_value": s.action_value_stats,
             "value_function/token/advantage": s.advantage_stats,
         }
@@ -1018,6 +1038,7 @@ class KLQPERTrainer(OnPolicyTrainer):
     def _batch_update(
         self,
         data: Dict[str, torch.Tensor],
+        scoring_function: Callable,
     ) -> Dict[str, float]:
         if self.buffer is None:
             queries = data["input_ids"]
@@ -1036,8 +1057,8 @@ class KLQPERTrainer(OnPolicyTrainer):
             # config-like and tokenizers
             config=self.args,
             generation_config=self.train_generation_config,
+            scoring_function=scoring_function,
             processing_class=self.processing_class,
-            reward_model_processing_class=self.reward_model_processing_class,
             # optimisation / performance
             optimizer=self.optimizer,
             accelerator=self.accelerator,
@@ -1045,7 +1066,6 @@ class KLQPERTrainer(OnPolicyTrainer):
             # stateful models and stats to be updated
             model=self.model,
             ref_policy=self.ref_policy,
-            reward_model=self.reward_model,
             klq_stats=self.stats,
             # data for this batch!
             buffer=self.buffer,
