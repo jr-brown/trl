@@ -30,6 +30,7 @@ from transformers import (
     PreTrainedTokenizerBase,
     TrainerCallback,
 )
+from trl.trainer.on_policy_trainer import OnPolicyStats
 
 from ..core import masked_mean, masked_whiten
 from ..models.utils import unwrap_model_for_generation
@@ -206,8 +207,9 @@ loss_function_map: dict[
 }
 
 
-class KLQStats:
+class KLQStats(OnPolicyStats):
     def __init__(self, stats_shape: Tuple[int, int, int], device: torch.device) -> None:
+        super().__init__(stats_shape, device)
         self.loss_function_stats = torch.zeros(stats_shape, device=device)
         self.action_value_stats = torch.zeros(stats_shape, device=device)
         self.state_value_error_stats = torch.zeros(stats_shape, device=device)
@@ -534,7 +536,7 @@ def klq_batch_update(
         # 6. compute advantages and returns
         # Initialise the GAE at 0 for the last time step.
         last_gae = 0
-        advantages_reversed = []
+        Deltas_reversed = []
         gen_length = responses.shape[1]  # This is the length of the responses.
         for t in reversed(range(gen_length)):
             # Extract the next token state-values
@@ -545,27 +547,27 @@ def klq_batch_update(
             )
             # Use the GAE backwards recursion relationship
             last_gae = delta + config.gamma * lam * last_gae
-            advantages_reversed.append(last_gae)
-        # Create the advantage estimates by reversing the GAE backward recursion
-        advantages = torch.stack(advantages_reversed[::-1], dim=1)
-        # Set the return estimates to be the advantage estimates
-        returns = (
-            config.alpha * advantages + action_values
-        )  # This used to be state_values
-        returns = torch.masked_fill(returns, padding_mask_plus_one, 0)  # BUGHOTSPOT
+            Deltas_reversed.append(last_gae)
+        # Create the Delta estimates by reversing the lambda-return backward recursion
+        Deltas = torch.stack(Deltas_reversed[::-1], dim=1)
 
-        # Whiten the advantages. Note that this is *non-optional* and *done at the entire batch level*
-        # advantages = masked_whiten(advantages, ~padding_mask)
-        # advantages = torch.masked_fill(advantages, padding_mask, 0)
+        # Typically whiten the Delta errors. See KLQConfig for extended comment.
+        if config.normalize_Delta_errors:
+            Deltas = masked_whiten(Deltas, ~padding_mask)
+            Deltas = torch.masked_fill(Deltas, padding_mask, 0)
+
+        # Set the return estimates to be the Delta estimates
+        returns = config.alpha * Deltas + action_values  # This used to be state_values
+        returns = torch.masked_fill(returns, padding_mask_plus_one, 0)  # BUGHOTSPOT
 
         # We only want the returns, so delete all other variables.
         del (
             rewards,
             last_gae,
-            advantages_reversed,
+            Deltas_reversed,
             delta,
             next_state_values,
-            advantages,
+            Deltas,
         )
         torch.cuda.empty_cache()
     processing_stop_time = time.perf_counter()

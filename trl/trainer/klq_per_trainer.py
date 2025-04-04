@@ -808,6 +808,12 @@ def klq_per_batch_update(
             Deltas_reversed.append(last_Delta)
         # Create the Delta estimates by reversing the lambda-return backward recursion
         Deltas = torch.stack(Deltas_reversed[::-1], dim=1)
+
+        # Typically whiten the Delta errors. See KLQConfig for extended comment.
+        if config.normalize_Delta_errors:
+            Deltas = masked_whiten(Deltas, ~padding_mask)
+            Deltas = torch.masked_fill(Deltas, padding_mask, 0)
+
         # Set the return estimates to be the Delta estimates
         returns = config.alpha * Deltas + action_values  # This used to be state_values
         returns = torch.masked_fill(returns, padding_mask_plus_one, 0)  # BUGHOTSPOT
