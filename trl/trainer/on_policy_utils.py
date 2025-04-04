@@ -111,6 +111,8 @@ class OnPolicyConfig(TrainingArguments):
     lam_episode_length: Optional[int] = None
     lam_schedule_type: str = "linear"
     final_answer_split_str: str | None = None
+    # Legacy
+    whiten_rewards: bool = False
 
     # Attributes derived in post_init
     local_batch_size: int = None
@@ -507,3 +509,100 @@ def forward_pass_on_rollouts(
     new_logprobs = torch.cat(new_logprobs_list, 0)
     state_value_prediction = torch.cat(new_state_values_list, 0)
     return new_logprobs, state_value_prediction
+
+
+def rloo_rollouts_to_loss_variables(
+    queries,
+    query_responses,
+    maybe_answer_ids,
+    logitss,
+    ref_policy,
+    processing_class,
+    context_length,
+    stop_token_id,
+    response_truncation_sequences,
+    local_rollout_forward_batch_size,
+    ref_temperature,
+    scoring_function,
+):
+    """
+    Processes the raw outputs of the policy model generation and computes the
+    necessary variables for the RLOO loss calculation.
+
+    This differs from the PPO/KLQ version in that it does not compute or return
+    state values or action values derived from a value model.
+
+    Lennie wrote this on 2025-04-04 by pulling out the relevant chunk of code from the original rloo_trainer.py and then updating various aspects of it to match the rollouts_to_loss_variables function.
+    """
+
+    responses = []
+    postprocessed_responses = []
+    logprobs = []
+    ref_logprobs = []
+    scores = []
+    sequence_lengths = []
+
+    pad_token_id = processing_class.pad_token_id
+
+    for i in range(0, queries.shape[0], local_rollout_forward_batch_size):
+        query = queries[i : i + local_rollout_forward_batch_size]
+        query_response = query_responses[i : i + local_rollout_forward_batch_size]
+        response = query_response[:, context_length:]
+
+        logprob = calc_logprob(i, response, logitss, local_rollout_forward_batch_size)
+        torch.cuda.empty_cache()
+
+        ref_logprob = calc_ref_logprob(
+            ref_policy,
+            query_response,
+            response,
+            processing_class.pad_token_id,
+            context_length,
+            ref_temperature,
+        )
+        torch.cuda.empty_cache()
+
+        # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
+        postprocessed_response = response
+        if (
+            stop_token_id is not None
+        ):  # handle the edge case when stop_token_id exists but is 0
+            postprocessed_response = truncate_response(
+                stop_token_id, pad_token_id, response
+            )
+
+        if response_truncation_sequences is not None:
+            postprocessed_response = truncate_response_from_sequences(
+                response_truncation_sequences, pad_token_id, postprocessed_response
+            )
+
+        # Response Processing 2. run reward model on the truncated responses
+        postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
+        sequence_length = (
+            first_true_indices(postprocessed_response == processing_class.pad_token_id)
+            - 1
+        )
+        score = scoring_function(postprocessed_query_response, maybe_answer_ids)
+
+        responses.append(response)
+        postprocessed_responses.append(postprocessed_response)
+        logprobs.append(logprob)
+        ref_logprobs.append(ref_logprob)
+        sequence_lengths.append(sequence_length)
+        scores.append(score)
+
+    responses = torch.cat(responses, 0)
+    postprocessed_responses = torch.cat(postprocessed_responses, 0)
+    logprobs = torch.cat(logprobs, 0)
+    ref_logprobs = torch.cat(ref_logprobs, 0)
+    sequence_lengths = torch.cat(sequence_lengths, 0)
+    scores = torch.cat(scores, 0)
+
+    return (
+        responses,
+        postprocessed_responses,
+        logprobs,
+        ref_logprobs,
+        sequence_lengths,
+        scores,
+    )

@@ -720,9 +720,10 @@ class OnPolicyTrainer(ABC, Trainer):
         scoring_function,
         maybe_answer_ids,
     ):
+        policy = unwrapped_model.policy if self.uses_value_model else unwrapped_model
         context_length = query.shape[1]
         query_response, logits = batch_generation(
-            unwrapped_model.policy,
+            policy,
             query,
             query.shape[0],
             processing_class.pad_token_id,
@@ -903,7 +904,9 @@ class OnPolicyTrainer(ABC, Trainer):
         self.accelerator.wait_for_everyone()
         unwrapped_model = self.accelerator.unwrap_model(self.model)
 
-        self.model = unwrapped_model.policy  # save only the policy
+        self.model = (
+            unwrapped_model.policy if self.uses_value_model else unwrapped_model
+        )  # save only the policy
 
         if self.is_deepspeed_enabled:
             backup_deepspeed = self.deepspeed
