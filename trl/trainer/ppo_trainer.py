@@ -530,8 +530,8 @@ class PPOTrainer(OnPolicyTrainer):
     def _initialise_stats(self) -> PPOStats:
         stats_shape = (
             self.args.num_epochs_per_batch_update,
-            self.args.local_batch_size,
-            self.args.local_mini_batch_size,
+            self.args.num_mini_batches,
+            self.args.gradient_accumulation_steps,
         )
         return PPOStats(stats_shape, self.accelerator.device)
 

@@ -633,9 +633,6 @@ def klq_batch_update(
             "policy/token/entropy": s.entropy_stats,
             "policy/traj/prev_ref_log_ratio": s.prev_ref_log_ratio_stats,
             "policy/traj/prev_new_log_ratio": s.prev_new_log_ratio_stats,
-            # "policy/kl_new_prev": s.kl_new_prev_stats,
-            # "policy/kl_prev_new": s.kl_prev_new_stats,
-            # "policy/kl_new_ref": s.kl_new_ref_stats,
             #
             "loss/token/action_value_loss": s.loss_function_stats,
             #
@@ -716,8 +713,8 @@ class KLQTrainer(OnPolicyTrainer):
     def _initialise_stats(self) -> KLQStats:
         stats_shape = (
             self.args.num_epochs_per_batch_update,
-            self.args.local_batch_size,
-            self.args.local_mini_batch_size,
+            self.args.num_mini_batches,
+            self.args.gradient_accumulation_steps,
         )
         return KLQStats(stats_shape, self.accelerator.device)
 
