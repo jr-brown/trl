@@ -34,7 +34,7 @@ from ..trainer.utils import (
     batch_generation,
     forward,
 )
-from .on_policy_trainer import OnPolicyTrainer
+from .on_policy_trainer import OnPolicyTrainer, ModelCardInfo
 from .ppo_config import PPOConfig
 from .on_policy_utils import rollouts_to_loss_variables
 
@@ -468,6 +468,22 @@ def ppo_batch_update(
 
 class PPOTrainer(OnPolicyTrainer):
     _tag_names = ["trl", "ppo"]
+
+    @property
+    def model_card_info(self) -> ModelCardInfo:
+        """Citation information for model card"""
+        return ModelCardInfo(
+            trainer_name="PPO",
+            trainer_citation="""\
+        @article{mziegler2019fine-tuning,
+            title        = {{Fine-Tuning Language Models from Human Preferences}},
+            author       = {Daniel M. Ziegler and Nisan Stiennon and Jeffrey Wu and Tom B. Brown and Alec Radford and Dario Amodei and Paul F. Christiano and Geoffrey Irving},
+            year         = 2019,
+            eprint       = {arXiv:1909.08593}
+        }""",
+            paper_title="Fine-Tuning Language Models from Human Preferences",
+            paper_id="1909.08593",
+        )
 
     def __init__(
         self,

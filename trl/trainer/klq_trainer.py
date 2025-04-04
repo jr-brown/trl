@@ -39,7 +39,7 @@ from ..trainer.utils import (
 )
 from .klq_config import KLQConfig
 from .on_policy_utils import rollouts_to_loss_variables, ScheduledParameter
-from .on_policy_trainer import OnPolicyTrainer
+from .on_policy_trainer import ModelCardInfo, OnPolicyTrainer
 
 
 ProcessingClass = PreTrainedTokenizerBase
@@ -661,6 +661,16 @@ def klq_batch_update(
 
 class KLQTrainer(OnPolicyTrainer):
     _tag_names = ["trl", "klq"]
+
+    @property
+    def model_card_info(self) -> ModelCardInfo:
+        """Citation information for model card"""
+        return ModelCardInfo(
+            trainer_name="KLQ",
+            trainer_citation="""to add when on arxiv!""",
+            paper_title="",
+            paper_id="",
+        )
 
     def __init__(
         self,

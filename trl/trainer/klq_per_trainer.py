@@ -47,7 +47,7 @@ from .on_policy_utils import (
     ScheduledParameter,
     INVALID_LOGPROB,
 )
-from .on_policy_trainer import OnPolicyTrainer
+from .on_policy_trainer import ModelCardInfo, OnPolicyTrainer
 
 # new imports for PER file
 from .klq_trainer import loss_function_map, LossFunctionTensors
@@ -991,6 +991,16 @@ def klq_per_batch_update(
 class KLQPERTrainer(OnPolicyTrainer):
     _tag_names = ["trl", "klq"]
     args: KLQPERConfig  # Lennie: add extra type hint to help language server
+
+    @property
+    def model_card_info(self) -> ModelCardInfo:
+        """Citation information for model card"""
+        return ModelCardInfo(
+            trainer_name="KLQ",
+            trainer_citation="""to add when on arxiv!""",
+            paper_title="",
+            paper_id="",
+        )
 
     def __init__(
         self,

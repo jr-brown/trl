@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 import gc
 import math
 import os
@@ -82,6 +83,14 @@ INVALID_LOGPROB = 1.0
 
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class ModelCardInfo:
+    trainer_name: str
+    trainer_citation: str
+    paper_title: str
+    paper_id: str
 
 
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
@@ -253,7 +262,9 @@ class OnPolicyTrainer(ABC, Trainer):
 
         assert processing_class is not None
 
-        assert uses_value_model == (value_model is not None), f"This abstract base class expects to receive a value model precisely when the boolean `uses_value_model` is True"
+        assert uses_value_model == (
+            value_model is not None
+        ), f"This abstract base class expects to receive a value model precisely when the boolean `uses_value_model` is True"
         self.uses_value_model = uses_value_model
 
         self.args = config
@@ -905,13 +916,18 @@ class OnPolicyTrainer(ABC, Trainer):
         if self.is_deepspeed_enabled:
             self.deepspeed = backup_deepspeed
 
+    @property
     @abstractmethod
+    def model_card_info(self) -> ModelCardInfo:
+        """Citation information for model card"""
+        pass
+
     def create_model_card(
         self,
         model_name: Optional[str] = None,
         dataset_name: Optional[str] = None,
         tags: Union[str, List[str], None] = None,
-    ) -> None:
+    ):
         """
         Creates a draft of a model card using the information available to the `Trainer`.
 
@@ -923,4 +939,40 @@ class OnPolicyTrainer(ABC, Trainer):
             tags (`str`, `List[str]` or `None`, *optional*, defaults to `None`):
                 Tags to be associated with the model card.
         """
-        pass
+        if not self.is_world_process_zero():
+            return
+
+        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(
+            self.model.config._name_or_path
+        ):
+            base_model = self.model.config._name_or_path
+        else:
+            base_model = None
+
+        tags = tags or []
+        if isinstance(tags, str):
+            tags = [tags]
+
+        if hasattr(self.model.config, "unsloth_version"):
+            tags.append("unsloth")
+
+        citation = textwrap.dedent(self.model_card_info.trainer_citation)
+
+        model_card = generate_model_card(
+            base_model=base_model,
+            model_name=model_name,
+            hub_model_id=self.hub_model_id,
+            dataset_name=dataset_name,
+            tags=tags,
+            wandb_url=(
+                wandb.run.get_url()
+                if is_wandb_available() and wandb.run is not None
+                else None
+            ),
+            trainer_name=self.model_card_info.trainer_name,
+            trainer_citation=citation,
+            paper_title=self.model_card_info.paper_title,
+            paper_id=self.model_card_info.paper_id,
+        )
+
+        model_card.save(os.path.join(self.args.output_dir, "README.md"))
