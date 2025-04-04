@@ -112,7 +112,7 @@ class OnPolicyStats(ABC):
 
 
 class OnPolicyTrainer(ABC, Trainer):
-    _tag_names = ["trl", "ppo"]
+    _tag_names = ["on_policy"]
 
     def __init__(
         self,
@@ -122,7 +122,8 @@ class OnPolicyTrainer(ABC, Trainer):
         # models
         policy: nn.Module,
         ref_policy: nn.Module,
-        value_model: nn.Module,
+        uses_value_model: bool,
+        value_model: nn.Module | None,
         # datasets and loaders
         train_dataset: Dataset,
         data_collator: Optional[DataCollatorWithPadding] = None,
@@ -137,20 +138,16 @@ class OnPolicyTrainer(ABC, Trainer):
         reward_model: nn.Module | None = None,
     ) -> None:
         """
+        NEW NOTES:
+         - when value_model is None, model is simply the policy
+         - when value_model is not None, model is a PolicyAndValueWrapper
+
         TERMINOLOGY:
             Outer loop - Iterations which consist of rollout gathering + multiple update steps.
             local - The prefix `local' refers specifically to being local to one *process*.
                     When the `world size' is equal to 1 then the `local' prefix means nothing.
                     In general, if there is both a local and non-local version of a variable, then the non-local version is not used for anything.
                     In other words, the local versions are the ones that actually turn up later in the code.
-
-        NOTES:
-            I think it's possible that there's a mistake in the code, but I don't understand how accelerator works well enough to be sure.
-            Basically, I'm confident that local_mini_batch_size is meant to be the number of rollouts that contribute to a single policy update.
-            However, when accelerator is called, the number of gradient accumulation steps is set to config.gradient_accumulation_steps.
-            Otherwise the naming convention seems quite strange.
-
-
 
         BATCH-SIZE-DETERMINING ARGUMENTS
         PRIMITIVE QUANTITIES
@@ -256,6 +253,9 @@ class OnPolicyTrainer(ABC, Trainer):
 
         assert processing_class is not None
 
+        assert uses_value_model == (value_model is not None), f"This abstract base class expects to receive a value model precisely when the boolean `uses_value_model` is True"
+        self.uses_value_model = uses_value_model
+
         self.args = config
         self.processing_class = processing_class
         self.policy = policy
@@ -271,7 +271,8 @@ class OnPolicyTrainer(ABC, Trainer):
         self.reward_model = reward_model
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
-        self.value_model = value_model
+        if self.uses_value_model:
+            self.value_model = value_model
         self.reward_model_processing_class = reward_model_processing_class
         self.data_collator = data_collator
         self.eval_dataset = eval_dataset
@@ -363,7 +364,11 @@ class OnPolicyTrainer(ABC, Trainer):
         #########
         # setup model, optimizer, and others
         #########
-        for module in [policy, ref_policy, value_model]:
+        # only process value_model if it is not None
+        modules = [policy, ref_policy]
+        if self.uses_value_model:
+            modules.append(value_model)
+        for module in modules:
             disable_dropout_in_model(module)
 
         if reward_model is not None:
@@ -371,7 +376,10 @@ class OnPolicyTrainer(ABC, Trainer):
 
         if config.stop_token and config.stop_token == "eos":  ### FLAG
             config.stop_token_id = processing_class.eos_token_id
-        self.model = PolicyAndValueWrapper(policy, value_model)
+        if self.uses_value_model:
+            self.model = PolicyAndValueWrapper(policy, value_model)
+        else:
+            self.model = policy
         self.model.config = policy.config  # needed for pushing to hub
         self.create_optimizer_and_scheduler(
             num_training_steps=config.num_total_batches
@@ -498,28 +506,6 @@ class OnPolicyTrainer(ABC, Trainer):
     def get_eval_dataloader(self) -> DataLoader:
         return self.eval_dataloader
 
-    def save_model(
-        self, output_dir: Optional[str] = None, _internal_call: bool = False
-    ):
-        backup_model = self.model
-
-        # Unwrap to fix bug that when model is a DataDistributedParallel it had no policy obj
-        self.accelerator.wait_for_everyone()
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
-
-        self.model = unwrapped_model.policy  # save only the policy
-
-        if self.is_deepspeed_enabled:
-            backup_deepspeed = self.deepspeed
-            self.deepspeed = self.model
-
-        super().save_model(output_dir, _internal_call)
-
-        self.model = backup_model
-
-        if self.is_deepspeed_enabled:
-            self.deepspeed = backup_deepspeed
-
     @abstractmethod
     def _initialise_stats(self) -> OnPolicyStats:
         pass
@@ -620,24 +606,30 @@ class OnPolicyTrainer(ABC, Trainer):
                     maybe_answer_ids, skip_special_tokens=True
                 )
                 final_answer_txts = [
-                    x.split(config.final_answer_split_str)[-1]
-                    for x in decoded_answers
+                    x.split(config.final_answer_split_str)[-1] for x in decoded_answers
                 ]
 
                 decoded_responses = self.processing_class.batch_decode(
                     postprocessed_query_response, skip_special_tokens=True
                 )
-                return torch.tensor([
-                    (
-                        -1.0
-                        if len(ans_parts := raw_x.split(config.final_answer_split_str)) <= 1 else
-                        float(y == ans_parts[-1])
-                    )
-                    for y, raw_x in zip(final_answer_txts, decoded_responses)
-                ]).to(self.accelerator.device)
+                return torch.tensor(
+                    [
+                        (
+                            -1.0
+                            if len(
+                                ans_parts := raw_x.split(config.final_answer_split_str)
+                            )
+                            <= 1
+                            else float(y == ans_parts[-1])
+                        )
+                        for y, raw_x in zip(final_answer_txts, decoded_responses)
+                    ]
+                ).to(self.accelerator.device)
 
             else:
-                raise ValueError("Need either a reward model or dataset-specified answer text in order to determine reward for answer.")
+                raise ValueError(
+                    "Need either a reward model or dataset-specified answer text in order to determine reward for answer."
+                )
 
         # The actual training loop
         for update in range(1, config.num_total_batches + 1):
@@ -684,7 +676,7 @@ class OnPolicyTrainer(ABC, Trainer):
             ):
                 self.generate_eval_completions(
                     scoring_function=scoring_function,
-                    max_num_batches=config.max_num_eval_batches
+                    max_num_batches=config.max_num_eval_batches,
                 )
                 torch.cuda.empty_cache()
 
@@ -891,12 +883,35 @@ class OnPolicyTrainer(ABC, Trainer):
                         }
                     )
 
+    def save_model(
+        self, output_dir: Optional[str] = None, _internal_call: bool = False
+    ):
+        backup_model = self.model
+
+        # Unwrap to fix bug that when model is a DataDistributedParallel it had no policy obj
+        self.accelerator.wait_for_everyone()
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+
+        self.model = unwrapped_model.policy  # save only the policy
+
+        if self.is_deepspeed_enabled:
+            backup_deepspeed = self.deepspeed
+            self.deepspeed = self.model
+
+        super().save_model(output_dir, _internal_call)
+
+        self.model = backup_model
+
+        if self.is_deepspeed_enabled:
+            self.deepspeed = backup_deepspeed
+
+    @abstractmethod
     def create_model_card(
         self,
         model_name: Optional[str] = None,
         dataset_name: Optional[str] = None,
         tags: Union[str, List[str], None] = None,
-    ):
+    ) -> None:
         """
         Creates a draft of a model card using the information available to the `Trainer`.
 
@@ -908,48 +923,4 @@ class OnPolicyTrainer(ABC, Trainer):
             tags (`str`, `List[str]` or `None`, *optional*, defaults to `None`):
                 Tags to be associated with the model card.
         """
-        if not self.is_world_process_zero():
-            return
-
-        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(
-            self.model.config._name_or_path
-        ):
-            base_model = self.model.config._name_or_path
-        else:
-            base_model = None
-
-        tags = tags or []
-        if isinstance(tags, str):
-            tags = [tags]
-
-        if hasattr(self.model.config, "unsloth_version"):
-            tags.append("unsloth")
-
-        citation = textwrap.dedent(
-            """\
-        @article{mziegler2019fine-tuning,
-            title        = {{Fine-Tuning Language Models from Human Preferences}},
-            author       = {Daniel M. Ziegler and Nisan Stiennon and Jeffrey Wu and Tom B. Brown and Alec Radford and Dario Amodei and Paul F. Christiano and Geoffrey Irving},
-            year         = 2019,
-            eprint       = {arXiv:1909.08593}
-        }"""
-        )
-
-        model_card = generate_model_card(
-            base_model=base_model,
-            model_name=model_name,
-            hub_model_id=self.hub_model_id,
-            dataset_name=dataset_name,
-            tags=tags,
-            wandb_url=(
-                wandb.run.get_url()
-                if is_wandb_available() and wandb.run is not None
-                else None
-            ),
-            trainer_name="PPO",
-            trainer_citation=citation,
-            paper_title="Fine-Tuning Language Models from Human Preferences",
-            paper_id="1909.08593",
-        )
-
-        model_card.save(os.path.join(self.args.output_dir, "README.md"))
+        pass

@@ -499,6 +499,7 @@ class PPOTrainer(OnPolicyTrainer):
             policy=policy,
             ref_policy=ref_policy,
             reward_model=reward_model,
+            uses_value_model=True,  # the PPO algorithm uses a value model
             value_model=value_model,
             train_dataset=train_dataset,
             data_collator=data_collator,

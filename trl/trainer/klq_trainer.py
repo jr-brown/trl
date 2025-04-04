@@ -348,8 +348,12 @@ def micro_batch_updates(
             )
 
             # Compute state_value error for logging
-            state_value_errors = torch.square(state_value_prediction - micro_batch_return)
-            state_value_error = masked_mean(state_value_errors, ~padding_mask[micro_batch_inds])
+            state_value_errors = torch.square(
+                state_value_prediction - micro_batch_return
+            )
+            state_value_error = masked_mean(
+                state_value_errors, ~padding_mask[micro_batch_inds]
+            )
 
             # Perform the update step.
             accelerator.backward(action_value_function_loss)
@@ -688,6 +692,7 @@ class KLQTrainer(OnPolicyTrainer):
             policy=policy,
             ref_policy=ref_policy,
             reward_model=reward_model,
+            uses_value_model=True,  # the KLQ algorithm uses a value model
             value_model=value_model,
             train_dataset=train_dataset,
             data_collator=data_collator,
