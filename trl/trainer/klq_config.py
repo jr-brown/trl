@@ -34,6 +34,12 @@ class KLQConfig(OnPolicyConfig):
             Loss function to use.
         loss_kwargs (`dict`, *optional*, defaults to `None`):
             Additional arguments to pass to the loss function.
+        normalize_Delta_errors (`bool`, *optional*, defaults to `True`):
+            Whether to normalize the Delta errors.
+            Note: in the trl PPO code these correspond to 'advantages' and the code includes a comment "this is *non-optional* and *done at the entire batch level*"
+            We had this normalisation commented out until 2025-04-04.
+            After a discussion on 2025-04-04, we decided to put the default at True.
+            This should improve stability and avoid a failure mode of small gradients late in training.
     """
 
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -44,4 +50,5 @@ class KLQConfig(OnPolicyConfig):
     alpha: float = 1.0
     loss_function: str = "l2_loss"
     loss_kwargs: Optional[dict] = None
+    normalize_Delta_errors: bool = True
 
