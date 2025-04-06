@@ -134,6 +134,7 @@ if TYPE_CHECKING:
     from .online_dpo_config import OnlineDPOConfig
     from .online_dpo_trainer import OnlineDPOTrainer
     from .on_policy_trainer import OnPolicyTrainer
+    from .on_policy_utils import OnPolicyConfig
     from .orpo_config import ORPOConfig
     from .orpo_trainer import ORPOTrainer
     from .ppo_config import PPOConfig
@@ -153,7 +154,6 @@ if TYPE_CHECKING:
         ConstantLengthDataset,
         DataCollatorForCompletionOnlyLM,
         FixedKLController,
-        OnPolicyConfig,
         RunningMoments,
         disable_dropout_in_model,
         empty_cache,
