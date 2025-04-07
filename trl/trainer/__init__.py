@@ -55,6 +55,7 @@ _import_structure = {
     "klq_trainer": ["KLQTrainer"],
     "klq_per_trainer": ["KLQPERTrainer", "KLQPERConfig"],
     "klq_config": ["KLQConfig"],
+    "klq_group_trainer": ["KLQGroupTrainer"],
     "kto_config": ["KTOConfig"],
     "kto_trainer": ["KTOTrainer"],
     "model_config": ["ModelConfig"],
@@ -140,6 +141,7 @@ if TYPE_CHECKING:
     from .ppo_trainer import PPOTrainer
     from .klq_config import KLQConfig
     from .klq_trainer import KLQTrainer
+    from .klq_group_trainer import KLQGroupTrainer
     from .ppov2_config import PPOv2Config
     from .ppov2_trainer import PPOv2Trainer
     from .reward_config import RewardConfig
