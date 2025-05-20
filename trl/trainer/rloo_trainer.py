@@ -234,6 +234,8 @@ class RLOOTrainer(Trainer):
             if isinstance(self.reward_model, nn.Module):
                 self.reward_model = self.reward_model.to(self.accelerator.device)
 
+        self.prompt_rewards = {}
+
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
 
@@ -372,6 +374,14 @@ class RLOOTrainer(Trainer):
                     ref_logprobs.append(ref_logprob)
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
+
+                    if hasattr(data, "prompt_id"):
+                        batch_prompt_ids = data["prompt_id"].to(device)
+                        for i, prompt_id in enumerate(batch_prompt_ids):
+                            prompt_id_val = prompt_id.item()
+                            if prompt_id_val not in self.prompt_rewards:
+                                self.prompt_rewards[prompt_id_val] = []
+                            self.prompt_rewards[prompt_id_val].append(score[i].item())
 
                 # Concatenate all batched results
                 responses = torch.cat(responses, 0)
@@ -698,3 +708,15 @@ class RLOOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+    def get_prompt_rewards(self):
+        """
+        Returns a dictionary mapping prompt IDs to their average rewards.
+
+        Returns:
+            dict: A dictionary where keys are prompt IDs and values are average rewards.
+        """
+        return {
+            prompt_id: sum(rewards) / len(rewards) if rewards else 0.0
+            for prompt_id, rewards in self.prompt_rewards.items()
+        }
