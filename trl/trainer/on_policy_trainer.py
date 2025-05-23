@@ -276,6 +276,7 @@ class OnPolicyTrainer(ABC, Trainer):
         self.data_collator = data_collator
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
+        self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
 
         # Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
         if os.environ.get("ACCELERATE_USE_DEEPSPEED", "false") == "true":
