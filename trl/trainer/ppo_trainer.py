@@ -370,6 +370,7 @@ def ppo_batch_update(
         advantages = masked_whiten(advantages, ~padding_mask)
         advantages = torch.masked_fill(advantages, padding_mask, 0)
         torch.cuda.empty_cache()
+
     processing_stop_time = time.perf_counter()
     processing_time = processing_stop_time - generation_stop_time
 

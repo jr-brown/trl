@@ -31,7 +31,7 @@ from transformers import (
     TrainerCallback,
 )
 
-from ..core import masked_mean, masked_whiten
+from ..core import masked_mean, masked_whiten, masked_rescale
 from ..models.utils import unwrap_model_for_generation
 from ..trainer.utils import (
     batch_generation,
@@ -546,6 +546,8 @@ def klq_batch_update(
         # Create the Delta estimates by reversing the lambda-return backward recursion
         Deltas = torch.stack(Deltas_reversed[::-1], dim=1)
 
+        # Should no longer do this as it centers errors, which is probably bad and empirically sus
+        # Left in for backwards compatibility / consistency between runs which don't specify not to do this
         # Typically whiten the Delta errors. See KLQConfig for extended comment.
         if config.normalize_Delta_errors:
             Deltas = masked_whiten(Deltas, ~padding_mask)
@@ -553,6 +555,10 @@ def klq_batch_update(
 
         # Set the return estimates to be the Delta estimates
         returns = config.alpha * Deltas + action_values  # This used to be state_values
+
+        if config.rescale_returns:
+            returns = masked_rescale(returns, ~padding_mask)
+
         returns = torch.masked_fill(returns, padding_mask_plus_one, 0)  # BUGHOTSPOT
 
         # We only want the returns, so delete all other variables.

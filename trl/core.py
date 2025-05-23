@@ -169,6 +169,12 @@ def masked_whiten(values: torch.Tensor, mask: torch.Tensor, shift_mean: bool = T
     return whitened
 
 
+def masked_rescale(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Rescale values with masked values."""
+    var = masked_var(values, mask)
+    return values * torch.rsqrt(var + 1e-8)
+
+
 def clip_by_value(x: torch.Tensor, tensor_min: float, tensor_max: float) -> torch.Tensor:
     """
     Tensor extension to torch.clamp

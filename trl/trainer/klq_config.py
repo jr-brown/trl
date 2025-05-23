@@ -40,6 +40,10 @@ class KLQConfig(OnPolicyConfig):
             We had this normalisation commented out until 2025-04-04.
             After a discussion on 2025-04-04, we decided to put the default at True.
             This should improve stability and avoid a failure mode of small gradients late in training.
+            This should probably be set to False, but default is left as True to ensure consistent behaviour between new and historical runs.
+        rescale_returns (`bool`, *optional*, defaults to `False`):
+            Whether to rescale the returns by dividing by the standard deviation of the returns.
+            This is (probably) preferred to z-normalizing the delta errors.
     """
 
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -51,4 +55,5 @@ class KLQConfig(OnPolicyConfig):
     loss_function: str = "l2_loss"
     loss_kwargs: Optional[dict] = None
     normalize_Delta_errors: bool = True
+    rescale_returns: bool = False
 
