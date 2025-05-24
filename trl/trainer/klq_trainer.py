@@ -554,11 +554,17 @@ def klq_batch_update(
             Deltas = torch.masked_fill(Deltas, padding_mask, 0)
 
         # Set the return estimates to be the Delta estimates
-        returns = config.alpha * Deltas + action_values  # This used to be state_values
 
-        if config.rescale_returns:
-            returns = masked_rescale(returns, ~padding_mask)
-            returns = torch.masked_fill(returns, padding_mask, 0)
+        if config.rescale_targets:
+            targets = Deltas + action_values
+            targets = masked_rescale(targets, ~padding_mask)
+            targets = torch.masked_fill(targets, padding_mask, 0)
+            returns = (config.alpha * targets) + ((1 - config.alpha) * action_values)
+
+        else:
+            # More efficient implementation if not rescaling targets.
+            # Equivalent to above if masked_rescale didn't occur.
+            returns = config.alpha * Deltas + action_values  # This used to be state_values
 
         returns = torch.masked_fill(returns, padding_mask_plus_one, 0)  # BUGHOTSPOT
 
