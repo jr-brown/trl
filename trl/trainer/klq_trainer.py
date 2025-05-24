@@ -558,6 +558,7 @@ def klq_batch_update(
 
         if config.rescale_returns:
             returns = masked_rescale(returns, ~padding_mask)
+            returns = torch.masked_fill(returns, padding_mask, 0)
 
         returns = torch.masked_fill(returns, padding_mask_plus_one, 0)  # BUGHOTSPOT
 
